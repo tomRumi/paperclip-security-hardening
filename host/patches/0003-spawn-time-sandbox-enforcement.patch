@@ -1,0 +1,177 @@
+--- a/node_modules/@paperclipai/server/dist/services/heartbeat.js
++++ b/node_modules/@paperclipai/server/dist/services/heartbeat.js
+@@ -59,6 +59,8 @@
+ import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
+ import fs from "node:fs/promises";
+ import path from "node:path";
++import { readFileSync as readHardeningConfigFile } from "node:fs"; // LOCAL-PATCH 0003
++import { resolvePaperclipInstanceRoot as hardeningInstanceRoot } from "../home-paths.js"; // LOCAL-PATCH 0003
+ import { execFile as execFileCallback } from "node:child_process";
+ import { promisify } from "node:util";
+ import { createHash, randomUUID } from "node:crypto";
+@@ -669,6 +671,148 @@
+     "execution_changes_requested",
+     "approval_approved",
+ ]);
++// LOCAL-PATCH 0003: spawn-time enforcement of the STORED sandbox. Whatever is merged into the run config (issue
++// assigneeAdapterOverrides, project/routine env, project workspace cwd), an agent whose stored adapterConfig has
++// filesystemScope or networkScope keeps those scopes and its host file-path keys (instructions*, workspaceStrategy, state/mcp paths), cannot launch outside the allowed workspace roots and cannot
++// inject launch-changing environment variables. Site values come from the hardening settings file, read once at startup
++// (written by the Sandbox hardening plugin, never agent-writable): $PAPERCLIP_HARDENING_CONFIG, else
++// <instance root>/hardening/config.json. Its `workspaceRoots` wins; without it $PAPERCLIP_SANDBOX_WORKSPACE_ROOT, else
++// Paperclip's own workspace dirs (<instance root>/workspaces and <instance root>/projects).
++const SANDBOX_ENFORCED_ADAPTER_CONFIG_KEYS = [
++    "filesystemScope", "networkScope", "networkAllowlist", "filesystemExtraPaths", "filesystemSandboxCommand",
++    "command", "hermesCommand", "agentCommand", "acpAgentCommand", "args", "extraArgs", "sandbox",
++    "dangerouslySkipPermissions", "dangerouslyBypassApprovalsAndSandbox", "dangerouslyBypassSandbox", "yolo",
++    "approvalMode", "permissionMode", "acpPermissionMode", "nonInteractivePermissions",
++    "acpNonInteractivePermissions", "codexPermissionMode", "opencodePermissionMode", "acpxPermissionMode", "chrome",
++    "instructionsFilePath", "instructionsRootPath", "instructionsEntryFile", "instructionsBundleMode", "workspaceStrategy",
++    "stateDir", "acpStateDir", "mcpConfigPath",
++];
++function readHardeningConfig0003() {
++    let file = process.env.PAPERCLIP_HARDENING_CONFIG;
++    try {
++        file = file || path.join(hardeningInstanceRoot(), "hardening", "config.json");
++        const parsed = JSON.parse(readHardeningConfigFile(file, "utf8"));
++        if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
++            return parsed;
++        logger.warn({ event: "hardening_config", file }, "hardening settings file is not a JSON object; using defaults");
++    }
++    catch (err) {
++        if (err?.code !== "ENOENT")
++            logger.warn({ event: "hardening_config", file, err: err?.message }, "hardening settings file is unreadable; using defaults");
++    }
++    return {};
++}
++const HARDENING_CONFIG_0003 = readHardeningConfig0003();
++const SANDBOX_WORKSPACE_ROOTS = (Array.isArray(HARDENING_CONFIG_0003.workspaceRoots)
++    ? HARDENING_CONFIG_0003.workspaceRoots.filter((root) => typeof root === "string").join(path.delimiter)
++    : process.env.PAPERCLIP_SANDBOX_WORKSPACE_ROOT || ["workspaces", "projects"].map((dir) => path.join(hardeningInstanceRoot(), dir)).join(path.delimiter))
++    .split(path.delimiter)
++    .map((root) => root.trim())
++    .filter((root) => path.isAbsolute(root))
++    .map((root) => path.resolve(root));
++const SANDBOX_SYSTEM_PATH_DIRS = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/snap"];
++function sandboxStoredPlainEnvValue(binding) {
++    if (typeof binding === "string")
++        return binding;
++    const record = parseObject(binding);
++    return record.type === "plain" && typeof record.value === "string" ? record.value : undefined;
++}
++function sandboxEnvDropReason(key, value, storedValue, managedAi) {
++    if (typeof value === "string" && value === storedValue)
++        return null;
++    if (/SANDBOX/i.test(key))
++        return "changes how the sandbox is configured or launched";
++    if (/^BWRAP/i.test(key))
++        return "changes how bubblewrap runs";
++    if (/^(LD_|DYLD_)/.test(key) || key === "GLIBC_TUNABLES")
++        return "injects code through the dynamic loader";
++    if (key === "NODE_OPTIONS" || key === "NODE_PATH")
++        return "injects code into node processes (including the proxy bridge)";
++    if (key === "BASH_ENV" || key === "ENV")
++        return "runs a startup script in the launched shell";
++    if (/^(https?|all|no)_proxy$/i.test(key))
++        return "proxy settings are owned by the allowlist proxy";
++    if (key === "PATH") {
++        const inSystemDirs = typeof value === "string" && value.split(":").every((entry) => path.isAbsolute(entry) &&
++            SANDBOX_SYSTEM_PATH_DIRS.some((dir) => path.resolve(entry) === dir || path.resolve(entry).startsWith(`${dir}/`)));
++        return inSystemDirs ? null : "PATH points outside system directories";
++    }
++    if (!managedAi && ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME"].includes(key))
++        return "redirects the credential directory that is bound into the sandbox";
++    return null;
++}
++async function sandboxRealPath(candidate) {
++    let current = path.resolve(candidate);
++    const tail = [];
++    for (;;) {
++        try {
++            return path.join(await fs.realpath(current), ...tail.reverse());
++        }
++        catch (err) {
++            // Missing directories are resolved through their nearest existing parent; dangling links are refused.
++            if ((err?.code !== "ENOENT" && err?.code !== "ENOTDIR") || await fs.lstat(current).then(() => true, () => false))
++                throw err;
++            const parent = path.dirname(current);
++            if (parent === current)
++                throw err;
++            tail.push(path.basename(current));
++            current = parent;
++        }
++    }
++}
++async function assertSandboxWorkspaceAllowed(label, dir) {
++    const real = await sandboxRealPath(dir).catch(() => null);
++    const roots = await Promise.all(SANDBOX_WORKSPACE_ROOTS.map((root) => sandboxRealPath(root).catch(() => root)));
++    const inside = real !== null && roots.some((root) => {
++        const rel = path.relative(root, real);
++        return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
++    });
++    if (!inside) {
++        throw new Error(`Sandbox policy: ${label} "${dir}" (resolves to ${real ?? "an unresolvable path"}) is outside the allowed workspace roots ` +
++            `(${SANDBOX_WORKSPACE_ROOTS.join(", ") || "none"}). Set them in the Sandbox hardening settings (workspace roots).`);
++    }
++}
++async function enforceStoredSandboxConfig(input) {
++    const stored = parseObject(input.agent.adapterConfig);
++    if (!stored.filesystemScope && !stored.networkScope)
++        return input.runtimeConfig;
++    const config = { ...input.runtimeConfig };
++    const logAction = (action, message) => logger.warn({ event: "sandbox_enforcement", action, agentId: input.agent.id, runId: input.runId }, `sandbox enforcement: ${message}`);
++    const enforcedKeys = input.managedAi ? SANDBOX_ENFORCED_ADAPTER_CONFIG_KEYS : [...SANDBOX_ENFORCED_ADAPTER_CONFIG_KEYS, "managedAiConnection"];
++    for (const key of enforcedKeys) {
++        if (JSON.stringify(config[key]) === JSON.stringify(stored[key]))
++            continue;
++        if (stored[key] === undefined)
++            delete config[key];
++        else
++            config[key] = stored[key];
++        logAction("restore_config_key", `restored stored adapterConfig.${key} (run override ignored)`);
++    }
++    const env = parseObject(config.env);
++    const storedEnv = parseObject(stored.env);
++    const nextEnv = { ...env };
++    for (const [key, value] of Object.entries(env)) {
++        const reason = sandboxEnvDropReason(key, value, sandboxStoredPlainEnvValue(storedEnv[key]), input.managedAi);
++        if (!reason)
++            continue;
++        delete nextEnv[key];
++        logAction("drop_env", `dropped env ${key}: ${reason}`);
++    }
++    config.env = nextEnv;
++    const dirs = [...input.workspaceDirs, ["adapterConfig.cwd", config.cwd], ["adapterConfig.workspaceDir", config.workspaceDir]];
++    for (const [label, dir] of dirs) {
++        if (typeof dir !== "string" || dir.length === 0)
++            continue;
++        try {
++            await assertSandboxWorkspaceAllowed(label, dir);
++        }
++        catch (err) {
++            logAction("refuse_run", `refused run, ${label} is outside the allowed workspace roots`);
++            throw err;
++        }
++    }
++    return config;
++}
+ const SESSIONED_LOCAL_ADAPTERS = new Set([
+     "claude_local",
+     "codex_local",
+@@ -18164,6 +18308,16 @@
+                                 }
+                                 : {}),
+                         };
++                        // LOCAL-PATCH 0003
++                        if (!executionTarget || executionTarget.kind === "local") {
++                            runtimeConfig = await enforceStoredSandboxConfig({
++                                agent,
++                                runId: run.id,
++                                runtimeConfig,
++                                workspaceDirs: [["execution workspace", executionWorkspace.cwd], ["context workspace", adapterContext.paperclipWorkspace?.cwd]],
++                                managedAi: Boolean(managedAiRuntime),
++                            });
++                        }
+                         const runtimeTools = createAdapterRuntimeToolAccess({
+                             agentId: agent.id,
+                             companyId: agent.companyId,

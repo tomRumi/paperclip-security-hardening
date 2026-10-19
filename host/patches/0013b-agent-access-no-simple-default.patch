@@ -1,0 +1,18 @@
+--- a/node_modules/@paperclipai/server/dist/routes/agents.js
++++ b/node_modules/@paperclipai/server/dist/routes/agents.js
+@@ -1285,14 +1285,7 @@
+                 grants,
+             };
+         }
+-        if (membership?.status === "active") {
+-            return {
+-                canAssignTasks: true,
+-                taskAssignSource: "simple_default",
+-                membership,
+-                grants,
+-            };
+-        }
++        // LOCAL-PATCH 0013: no "simple_default" derived tasks:assign (authorization.js requires an explicit grant to assign to others).
+         return {
+             canAssignTasks: false,
+             taskAssignSource: "none",

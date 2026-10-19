@@ -1,0 +1,40 @@
+# TEMPLATE. Install as /etc/systemd/system/itsec-lynis.service
+[Unit]
+Description=ITSec weekly Lynis audit (non-root --pentest mode) with diff against the previous run
+
+[Service]
+Type=oneshot
+User=itsec
+Group=itsec
+SupplementaryGroups=adm
+Environment=ITSEC_CONFIG=/etc/itsec/config.json
+Environment=HOME=/var/lib/itsec
+ExecStart=/opt/itsec/bin/itsec-lynis
+TimeoutStartSec=3600
+Nice=15
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/itsec
+StateDirectory=itsec
+StateDirectoryMode=0700
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+IPAddressDeny=any

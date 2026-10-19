@@ -1,0 +1,226 @@
+--- a/node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js
++++ b/node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js
+@@ -1,3 +1,4 @@
++import dns from "node:dns"; // LOCAL-PATCH 0015
+ import fs from "node:fs/promises";
+ import http from "node:http";
+ import net from "node:net";
+@@ -82,6 +83,15 @@
+     const trimmed = entry.trim();
+     if (!trimmed)
+         throw new Error(`networkAllowlist[${index}] must not be empty.`);
++    // LOCAL-PATCH 0015: "*:<port>" means any host on that port whose every resolved address is public (see
++    // resolveNetworkTarget). The port is required; a bare "*" and "*.domain" stay rejected below.
++    const publicWildcard = /^\*:(\d{1,5})$/.exec(trimmed);
++    if (publicWildcard) {
++        const wildcardPort = Number(publicWildcard[1]);
++        if (wildcardPort < 1 || wildcardPort > 65535)
++            throw new Error(`networkAllowlist[${index}] wildcard port must be between 1 and 65535.`);
++        return { hostname: "*", port: String(wildcardPort), publicOnly: true };
++    }
+     let hostname;
+     let port;
+     try {
+@@ -96,7 +106,7 @@
+         throw new Error(`networkAllowlist[${index}] must be a hostname, hostname:port, or origin URL.`);
+     }
+     if (!hostname || hostname === "*" || hostname.startsWith("*.")) {
+-        throw new Error(`networkAllowlist[${index}] must use an exact hostname; wildcards are not supported.`);
++        throw new Error(`networkAllowlist[${index}] must use an exact hostname or "*:<port>" (public hosts only); other wildcards are not supported.`); // LOCAL-PATCH 0015
+     }
+     return { hostname, port };
+ }
+@@ -126,7 +136,125 @@
+ }
+ function isNetworkTargetAllowed(hostname, port, rules) {
+     const normalizedHostname = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+-    return rules.some((rule) => rule.hostname === normalizedHostname && (rule.port === null || rule.port === port));
++    return rules.some((rule) => !rule.publicOnly && rule.hostname === normalizedHostname && (rule.port === null || rule.port === port)); // LOCAL-PATCH 0015
++}
++// LOCAL-PATCH 0015: public-address classifier for "*:<port>" rules. Anything not clearly public is refused.
++function parseIPv4Address(text) {
++    const parts = text.split(".");
++    if (parts.length !== 4 || !parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255))
++        return null;
++    return parts.map(Number);
++}
++function isPublicIPv4Bytes([a, b, c]) {
++    if (a === 0 || a === 10 || a === 127 || a >= 224) // 0/8, 10/8, 127/8, 224/4 multicast, 240/4 reserved + broadcast
++        return false;
++    if (a === 100 && b >= 64 && b <= 127) // 100.64/10 CGNAT (tailnet)
++        return false;
++    if (a === 169 && b === 254) // 169.254/16 link-local / cloud metadata
++        return false;
++    if (a === 172 && b >= 16 && b <= 31) // 172.16/12
++        return false;
++    if (a === 192 && b === 0 && c === 0) // 192.0.0/24
++        return false;
++    if (a === 192 && b === 168) // 192.168/16
++        return false;
++    if (a === 198 && (b === 18 || b === 19)) // 198.18/15
++        return false;
++    return true;
++}
++function parseIPv6Address(text) {
++    let rest = text;
++    let tail = [];
++    const lastColon = rest.lastIndexOf(":");
++    if (rest.includes(".")) { // embedded dotted IPv4 in the last 32 bits
++        const v4 = parseIPv4Address(rest.slice(lastColon + 1));
++        if (!v4)
++            return null;
++        tail = [(v4[0] << 8) | v4[1], (v4[2] << 8) | v4[3]];
++        rest = rest.slice(0, lastColon + 1);
++        if (rest.endsWith(":") && !rest.endsWith("::"))
++            rest = rest.slice(0, -1);
++    }
++    const halves = rest.split("::");
++    if (halves.length > 2)
++        return null;
++    const toGroups = (part) => (part === "" ? [] : part.split(":"));
++    const head = toGroups(halves[0]);
++    const after = halves.length === 2 ? toGroups(halves[1]) : [];
++    if (![...head, ...after].every((group) => /^[0-9a-f]{1,4}$/i.test(group)))
++        return null;
++    const known = head.length + after.length + tail.length;
++    if (halves.length === 1 ? known !== 8 : known > 7)
++        return null;
++    const groups = [
++        ...head.map((group) => parseInt(group, 16)),
++        ...new Array(8 - known).fill(0),
++        ...after.map((group) => parseInt(group, 16)),
++        ...tail,
++    ];
++    return groups.length === 8 ? groups : null;
++}
++function isPublicIPv6Groups(g) {
++    const embeddedV4 = () => [g[6] >> 8, g[6] & 0xff, g[7] >> 8, g[7] & 0xff];
++    if (g.slice(0, 6).every((group) => group === 0)) // ::/96: ::, ::1 and IPv4-compatible ::a.b.c.d
++        return isPublicIPv4Bytes(embeddedV4());
++    if (g.slice(0, 5).every((group) => group === 0) && (g[5] === 0xffff)) // ::ffff:0:0/96 IPv4-mapped
++        return isPublicIPv4Bytes(embeddedV4());
++    if (g.slice(0, 4).every((group) => group === 0) && g[4] === 0xffff && g[5] === 0) // ::ffff:0:0:0/96 IPv4-translated
++        return isPublicIPv4Bytes(embeddedV4());
++    if (g[0] === 0x64 && g[1] === 0xff9b && g.slice(2, 6).every((group) => group === 0)) // 64:ff9b::/96 NAT64
++        return isPublicIPv4Bytes(embeddedV4());
++    if (g[0] === 0x64 && g[1] === 0xff9b && g[2] === 1) // 64:ff9b:1::/48 local-use NAT64
++        return false;
++    if (g[0] === 0x2002) // 2002::/16 6to4: judge the embedded IPv4
++        return isPublicIPv4Bytes([g[1] >> 8, g[1] & 0xff, g[2] >> 8, g[2] & 0xff]);
++    if ((g[0] & 0xfe00) === 0xfc00) // fc00::/7 unique local
++        return false;
++    if ((g[0] & 0xffc0) === 0xfe80 || (g[0] & 0xffc0) === 0xfec0) // fe80::/10 link-local, fec0::/10 old site-local
++        return false;
++    if ((g[0] & 0xff00) === 0xff00) // ff00::/8 multicast
++        return false;
++    return true;
++}
++function isPublicIpAddress(address) {
++    const text = String(address).trim().replace(/^\[|\]$/g, "").replace(/%.*$/, "").toLowerCase();
++    if (net.isIPv4(text)) {
++        const v4 = parseIPv4Address(text);
++        return v4 !== null && isPublicIPv4Bytes(v4);
++    }
++    if (net.isIPv6(text)) {
++        const v6 = parseIPv6Address(text);
++        return v6 !== null && isPublicIPv6Groups(v6);
++    }
++    return false;
++}
++// LOCAL-PATCH 0015: decide a proxy target. Exact rules / trusted URLs behave as before (connect by name). Otherwise a
++// "*:<port>" rule allows the target only if EVERY address it resolves to is public, and the caller must connect to the
++// returned address (resolved once here, so a second lookup cannot rebind to an internal address).
++// Returns null (denied), { connectHost: null } (exact rule) or { connectHost: "<checked ip>" }.
++async function resolveNetworkTarget(hostname, port, rules) {
++    if (isNetworkTargetAllowed(hostname, port, rules))
++        return { connectHost: null };
++    if (!rules.some((rule) => rule.publicOnly && rule.port === port))
++        return null;
++    const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
++    if (!normalized)
++        return null;
++    let addresses;
++    if (net.isIP(normalized)) {
++        addresses = [normalized];
++    }
++    else {
++        try {
++            addresses = (await dns.promises.lookup(normalized, { all: true, verbatim: true })).map((entry) => entry.address);
++        }
++        catch {
++            return null;
++        }
++    }
++    if (addresses.length === 0 || !addresses.every(isPublicIpAddress))
++        return null;
++    return { connectHost: addresses[0] };
+ }
+ function assertUnixSocketPathLength(socketPath) {
+     const pathBytes = Buffer.byteLength(socketPath);
+@@ -196,7 +324,8 @@
+     if (rules.length === 0) {
+         throw new Error('networkScope="allowlist" requires at least one valid networkAllowlist hostname or HTTP(S) networkTrustedUrl.');
+     }
+-    const server = http.createServer((request, response) => {
++    const policyDecision = Symbol("paperclip.localPatch0015.networkDecision"); // LOCAL-PATCH 0015
++    const server = http.createServer(function onProxyRequest(request, response) { // LOCAL-PATCH 0015: named, re-entered once the async policy check is done
+         let target;
+         try {
+             target = new URL(request.url ?? "");
+@@ -210,11 +339,26 @@
+             writeProxyError(response, 400, "https_requires_connect", "HTTPS targets must use CONNECT through the Paperclip sandbox proxy.");
+             return;
+         }
+-        if (!isNetworkTargetAllowed(target.hostname, port, rules)) {
+-            writeProxyError(response, 403, "network_target_denied", "Network target denied by Paperclip sandbox policy.");
++        // LOCAL-PATCH 0015: policy check (may resolve DNS), then handle the request with the decision attached.
++        const decision = request[policyDecision];
++        if (!decision) {
++            resolveNetworkTarget(target.hostname, port, rules).catch(() => null).then((resolved) => {
++                if (response.destroyed || response.headersSent)
++                    return; // the client left during the lookup
++                if (!resolved) {
++                    writeProxyError(response, 403, "network_target_denied", "Network target denied by Paperclip sandbox policy.");
++                    return;
++                }
++                request[policyDecision] = resolved;
++                onProxyRequest(request, response);
++            }).catch(() => response.destroy());
+             return;
+         }
+-        const upstream = http.request(target, {
++        // LOCAL-PATCH 0015: a "*:<port>" decision connects to the checked address; Host keeps the requested name.
++        const upstreamTarget = new URL(target.href);
++        if (decision.connectHost)
++            upstreamTarget.hostname = net.isIPv6(decision.connectHost) ? `[${decision.connectHost}]` : decision.connectHost;
++        const upstream = http.request(upstreamTarget, {
+             method: request.method,
+             headers: { ...request.headers, host: target.host },
+         }, (upstreamResponse) => {
+@@ -230,11 +374,24 @@
+         const separator = request.url?.lastIndexOf(":") ?? -1;
+         const hostname = separator > 0 ? request.url.slice(0, separator).replace(/^\[|\]$/g, "") : "";
+         const port = separator > 0 ? request.url.slice(separator + 1) : "443";
+-        if (!hostname || !/^\d+$/.test(port) || !isNetworkTargetAllowed(hostname, port, rules)) {
++        if (!hostname || !/^\d+$/.test(port)) { // LOCAL-PATCH 0015: the policy check itself is async, below
+             clientSocket.end(connectProxyError("network_target_denied", "Network target denied by Paperclip sandbox policy."));
+             return;
+         }
+-        const upstream = net.connect(Number(port), hostname, () => {
++        // LOCAL-PATCH 0015: the upstream socket is created now (so the close/error wiring below is unchanged) but only
++        // connected after the policy check, to the address that check approved.
++        const upstream = new net.Socket();
++        resolveNetworkTarget(hostname, port, rules).catch(() => null).then((decision) => {
++            if (clientSocket.destroyed || upstream.destroyed)
++                return; // the client left during the lookup
++            if (!decision) {
++                upstream.destroy();
++                clientSocket.end(connectProxyError("network_target_denied", "Network target denied by Paperclip sandbox policy."));
++                return;
++            }
++            upstream.connect(Number(port), decision.connectHost ?? hostname);
++        }).catch(() => clientSocket.destroy());
++        upstream.once("connect", () => { // LOCAL-PATCH 0015
+             clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+             if (head.length > 0)
+                 upstream.write(head);

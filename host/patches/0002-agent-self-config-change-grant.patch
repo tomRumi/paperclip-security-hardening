@@ -1,0 +1,129 @@
+--- a/node_modules/@paperclipai/server/dist/routes/agents.js
++++ b/node_modules/@paperclipai/server/dist/routes/agents.js
+@@ -249,6 +249,22 @@
+             hireRunLocks.delete(key);
+     }
+ }
++// LOCAL-PATCH 0002: adapterConfig keys that decide what an agent process can reach or run (sandbox scopes and
++// allowlists, executed commands/arguments, environment, working directory, permission bypass). An agent actor may
++// not change these on any agent, itself included, even when it holds agents:configure: board actors only.
++const AGENT_EXECUTION_ADAPTER_CONFIG_KEYS = [
++    "filesystemScope", "networkScope", "networkAllowlist", "filesystemExtraPaths", "filesystemSandboxCommand",
++    "command", "hermesCommand", "agentCommand", "acpAgentCommand", "args", "extraArgs",
++    "env", "cwd", "workspaceDir", "sandbox", "dangerouslySkipPermissions", "dangerouslyBypassApprovalsAndSandbox",
++    "dangerouslyBypassSandbox", "yolo", "approvalMode", "permissionMode", "acpPermissionMode", "nonInteractivePermissions",
++    "acpNonInteractivePermissions", "codexPermissionMode", "opencodePermissionMode", "acpxPermissionMode", "chrome",
++    "workspaceStrategy", "managedAiConnection",
++    "instructionsFilePath", "instructionsRootPath", "instructionsEntryFile", "instructionsBundleMode", "agentsMdPath",
++    "promptTemplate", "bootstrapPromptTemplate",
++];
++function isAgentExecutionAdapterConfigKey(key) {
++    return AGENT_EXECUTION_ADAPTER_CONFIG_KEYS.includes(key) || key.startsWith("instructions");
++}
+ export function agentRoutes(db, options = {}) {
+     // Legacy hardcoded maps — used as fallback when adapter module does not
+     // declare capability flags explicitly.
+@@ -2288,6 +2304,36 @@
+     async function assertCanManageInstructionsPath(req, targetAgent) {
+         await assertCanApplyProtectedAgentChange(req, targetAgent, [agentInstructionsChangeTargetKey(targetAgent.id)]);
+     }
++    // LOCAL-PATCH 0002: self edits are normally allowed (allow_self); route execution/sandbox-relevant changes
++    // through the change grant instead so an agent cannot widen or drop its own sandbox.
++    async function assertAgentActorMayChangeExecutionConfig(req, targetAgent, next) {
++        if (req.actor.type !== "agent")
++            return;
++        const current = asRecord(targetAgent.adapterConfig) ?? {};
++        const nextConfig = asRecord(next.adapterConfig) ?? current;
++        const changed = [...new Set([...Object.keys(nextConfig), ...Object.keys(current)])]
++            .filter(isAgentExecutionAdapterConfigKey)
++            .filter((key) => JSON.stringify(nextConfig[key]) !== JSON.stringify(current[key]))
++            .map((key) => `adapterConfig.${key}`);
++        if (next.adapterType !== undefined && next.adapterType !== targetAgent.adapterType)
++            changed.push("adapterType");
++        if (next.defaultEnvironmentId !== undefined && next.defaultEnvironmentId !== targetAgent.defaultEnvironmentId)
++            changed.push("defaultEnvironmentId");
++        if (changed.length === 0)
++            return;
++        logger.warn({ event: "agent_execution_config_denied", agentId: req.actor.agentId ?? null, targetAgentId: targetAgent.id, runId: req.actor.runId ?? null, changed }, "execution/sandbox config change denied for agent actor (board only)");
++        throw forbidden("Sandbox/execution configuration can only be changed by a board user", { code: "execution_config_board_only", changed });
++    }
++    // LOCAL-PATCH 0002: instructions bundle writes (any file/mode/root change, own bundle included) are board-only for agent actors:
++    // a prompt-injected agent must not persist instructions across runs. selfAllowed stays available but is unused.
++    function assertAgentInstructionsWriteScope(req, targetAgent, { selfAllowed }) {
++        if (req.actor.type !== "agent")
++            return;
++        if (selfAllowed && req.actor.agentId === targetAgent.id)
++            return;
++        logger.warn({ event: "agent_instructions_write_denied", agentId: req.actor.agentId ?? null, targetAgentId: targetAgent.id, method: req.method, path: req.originalUrl }, "instructions bundle write denied for agent actor (board only)");
++        throw forbidden("Instructions bundle changes for this target require a board user", { code: "instructions_write_board_only" });
++    }
+     async function assertCanApplyAgentProfileChange(req, targetAgent) {
+         await assertCanApplyProtectedAgentChange(req, targetAgent, [agentProfileChangeTargetKey(targetAgent.id)]);
+     }
+@@ -3184,6 +3230,10 @@
+         const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
+         if (!agent)
+             return;
++        if (req.actor.type === "agent") { // LOCAL-PATCH 0002: skill assignment is board-only for agents (self included): skills carry instructions
++            logger.warn({ event: "agent_skill_sync_denied", agentId: req.actor.agentId ?? null, targetAgentId: agent.id, runId: req.actor.runId ?? null }, "skill sync denied for agent actor (board only)");
++            throw forbidden("Skill assignment requires a board user", { code: "skill_sync_board_only" });
++        }
+         await assertCanUpdateAgent(req, agent);
+         const requestedSkills = normalizeDesiredSkillSelections(req.body.desiredSkills);
+         const { adapterConfig: nextAdapterConfig, desiredSkills, desiredSkillEntries, runtimeSkillEntries, } = await resolveDesiredSkillAssignment(agent.companyId, agent.adapterType, agent.adapterConfig, requestedSkills, req.body.mode, 
+@@ -3556,6 +3606,7 @@
+             rollbackAdapterType === "paperclip_runner") {
+             await assertFreshPaperclipRunnerProvider(existing.companyId, rollbackAdapterType, rollbackAdapterConfig);
+         }
++        await assertAgentActorMayChangeExecutionConfig(req, existing, { adapterType: rollbackAdapterType, adapterConfig: rollbackAdapterConfig, defaultEnvironmentId: typeof rollbackConfig.defaultEnvironmentId === "string" ? rollbackConfig.defaultEnvironmentId : null }); // LOCAL-PATCH 0002
+         const actor = getActorInfo(req);
+         const updated = await svc.rollbackConfigRevision(id, revisionId, {
+             agentId: actor.agentId,
+@@ -4126,6 +4177,7 @@
+         const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
+         if (!existing)
+             return;
++        assertAgentInstructionsWriteScope(req, existing, { selfAllowed: false }); // LOCAL-PATCH 0002
+         await assertCanManageInstructionsPath(req, existing);
+         assertExternalInstructionsAdmin(req, existing);
+         if (req.body.mode === "external")
+@@ -4201,6 +4253,7 @@
+         const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
+         if (!existing)
+             return;
++        assertAgentInstructionsWriteScope(req, existing, { selfAllowed: false }); // LOCAL-PATCH 0002
+         const entryFile = deriveBundleState(existing).entryFile;
+         if (instructionPath(req.body.path) === entryFile) {
+             assertExternalInstructionsAdmin(req, existing);
+@@ -4282,6 +4335,7 @@
+         const existing = await getAccessibleResource(req, res, svc.getById(req.params.id), "Agent not found");
+         if (!existing)
+             return;
++        assertAgentInstructionsWriteScope(req, existing, { selfAllowed: false }); // LOCAL-PATCH 0002
+         assertExternalInstructionsAdmin(req, existing);
+         const runId = req.params.runId;
+         if (!isUuidLike(runId))
+@@ -4328,6 +4382,7 @@
+         const existing = await getAccessibleResource(req, res, svc.getById(req.params.id), "Agent not found");
+         if (!existing)
+             return;
++        assertAgentInstructionsWriteScope(req, existing, { selfAllowed: false }); // LOCAL-PATCH 0002
+         assertExternalInstructionsAdmin(req, existing);
+         const receipt = await instructionRevisions.restore({ companyId: existing.companyId, agentId: existing.id,
+             entryFile: req.body.path, baseRevisionId: req.body.baseRevisionId, revisionId: req.body.revisionId }, req.actor);
+@@ -4343,6 +4398,7 @@
+         const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
+         if (!existing)
+             return;
++        assertAgentInstructionsWriteScope(req, existing, { selfAllowed: false }); // LOCAL-PATCH 0002
+         await assertCanManageInstructionsPath(req, existing);
+         assertExternalInstructionsAdmin(req, existing);
+         const relativePath = typeof req.query.path === "string" ? req.query.path : "";
+@@ -4544,6 +4600,7 @@
+                 allowedSandboxProviders: allowedSandboxProvidersForAgent(requestedAdapterType),
+             });
+         }
++        await assertAgentActorMayChangeExecutionConfig(req, existing, patchData); // LOCAL-PATCH 0002
+         const touchesProfileFields = touchesAgentProfileChangeConsentFields(patchData);
+         const profileOnlyChange = touchesProfileFields && Object.keys(patchData).every((key) => AGENT_PROFILE_CHANGE_CONSENT_FIELDS.includes(key));
+         if (profileOnlyChange) {

@@ -1,0 +1,26 @@
+--- a/node_modules/@paperclipai/server/dist/routes/agents.js
++++ b/node_modules/@paperclipai/server/dist/routes/agents.js
+@@ -4180,6 +4180,12 @@
+                 res.status(403).json({ error: "Forbidden" });
+                 return;
+             }
++            // LOCAL-PATCH 0011: pipelines:write (canWritePipelines, true or false) is board-only; agents get 403 on any value.
++            if (req.body.canWritePipelines !== undefined) {
++                logger.warn({ event: "agent_permissions_grant_denied", agentId: actorAgent.id, targetAgentId: id, runId: req.actor.runId ?? null, canWritePipelines: req.body.canWritePipelines }, "agent permissions update denied: canWritePipelines is board-only");
++                res.status(403).json({ error: "canWritePipelines requires a board user", code: "permissions_grant_board_only" });
++                return;
++            }
+             if (actorAgent.role !== "ceo") {
+                 res.status(403).json({ error: "Only CEO can manage permissions" });
+                 return;
+@@ -4203,6 +4209,10 @@
+         const effectiveCanAssignTasks = agent.role === "ceo" || Boolean(agent.permissions?.canCreateAgents) || req.body.canAssignTasks;
+         await access.ensureMembership(agent.companyId, "agent", agent.id, "member", "active");
+         await access.setPrincipalPermission(agent.companyId, "agent", agent.id, "tasks:assign", effectiveCanAssignTasks, req.actor.type === "board" ? (req.actor.userId ?? null) : null);
++        // LOCAL-PATCH 0011: optional canWritePipelines -> unscoped pipelines:write grant (true) or removal of it (false); omitted = unchanged.
++        if (typeof req.body.canWritePipelines === "boolean") {
++            await access.setPrincipalPermission(agent.companyId, "agent", agent.id, "pipelines:write", req.body.canWritePipelines, req.actor.userId ?? null);
++        }
+         const actor = getActorInfo(req);
+         await logActivity(db, {
+             companyId: agent.companyId,

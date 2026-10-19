@@ -1,0 +1,17 @@
+{
+  "name": "paperclip-sandbox-hardening-repo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sandbox hardening for Paperclip agent runs: a Paperclip plugin with one switch per protection, Agent boxes with daily token caps, a self-test, and one-line installers for a separate-user watchdog and the Hermes sandbox wrapper.",
+  "license": "MIT",
+  "author": "<copyright holder>",
+  "keywords": ["paperclip", "paperclip-plugin", "security", "sandbox", "bwrap", "hardening", "watchdog", "ai-agents"],
+  "repository": { "type": "git", "url": "git+https://github.com/<org>/paperclip-sandbox-hardening.git" },
+  "homepage": "https://github.com/<org>/paperclip-sandbox-hardening#readme",
+  "bugs": { "url": "https://github.com/<org>/paperclip-sandbox-hardening/issues" },
+  "os": ["linux"],
+  "files": ["plugin", "host", "docs", "scripts", "README.md", "LICENSE", "SHA256SUMS"],
+  "scripts": {
+    "test": "(cd host/itsec && python3 -I -B -m unittest discover -s tests) && (cd host/install && python3 -I -B -m unittest discover -s tests) && (cd plugin && npm test)"
+  }
+}

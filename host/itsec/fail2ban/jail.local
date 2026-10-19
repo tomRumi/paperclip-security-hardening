@@ -1,0 +1,24 @@
+# TEMPLATE for /etc/fail2ban/jail.local (config only; nothing is installed or enabled by the itsec repo).
+# Ubuntu logs sshd to the journal (unit ssh.service; with OpenSSH >= 9.8 the process is "sshd-session"),
+# so the jail reads the journal: backend = systemd. The journalmatch deliberately names the UNIT only,
+# not _COMM, so it keeps working when sshd is split into sshd + sshd-session.
+# The host uses ufw, so bans go through ufw.
+
+[DEFAULT]
+backend    = systemd
+banaction  = ufw
+bantime    = 1h
+findtime   = 10m
+maxretry   = 5
+# Never ban the owner's own paths: add the private-network range and any fixed admin address here.
+ignoreip   = 127.0.0.1/8 ::1 100.64.0.0/10
+
+[sshd]
+enabled     = true
+port        = ssh
+filter      = sshd
+journalmatch = _SYSTEMD_UNIT=ssh.service
+# Repeat offenders: ban longer.
+bantime.increment = true
+bantime.factor    = 2
+bantime.maxtime   = 1w

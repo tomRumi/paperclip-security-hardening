@@ -1,0 +1,62 @@
+#!/usr/local/bin/node
+// Run Hermes Agent inside Paperclip's OWN local-process sandbox (bwrap, tmpfs root, filesystem scope,
+// network allowlist proxy). Set as the hermes_local adapter's `hermesCommand`; the adapter calls
+//   hermes-sandbox chat -q <prompt> ... --yolo   with cwd = project dir and env = full server env.
+// No confinement logic here: it only calls buildLocalProcessSandboxSpawnTarget() from adapter-utils.
+// Hermes gets an EMPTY env plus an allowlist, so server secrets (PAPERCLIP_AGENT_JWT_SECRET...) never enter.
+// Config (put in the agent's adapterConfig.env; all optional except ALLOW for real use):
+//   HERMES_SANDBOX_ALLOW  comma list of hosts[:port] reachable through the proxy (e.g. openrouter.ai)
+//   HERMES_SANDBOX_HOME   per-project HERMES_HOME (rw; default <project>/.hermes-home)
+//   HERMES_SANDBOX_PASS   extra env var names to pass (default: OPENROUTER_API_KEY only)
+//   HERMES_SANDBOX_BIN    command to run (default: hermes from PATH; tests point it at bash)
+//   HERMES_SANDBOX_RO     extra read-only paths (default: the Hermes install and its python)
+// Hardening: runs only when cwd (realpath) is under an allowed root; bwrap by absolute path; the child env is built
+// from scratch (env -i semantics) and BASH_FUNC_*, BASH_ENV, SHELLOPTS, BASHOPTS, PS4, PYTHON*, LD_* are always dropped.
+// Install where agents cannot write (root-owned, e.g. /usr/local/bin) once the sandbox is on.
+// Undo: unset hermesCommand on the agent.
+"use strict";
+const { spawn } = require("node:child_process");
+const os = require("node:os"), path = require("node:path"), fs = require("node:fs");
+
+const UTILS = process.env.PAPERCLIP_ADAPTER_UTILS ||   // stable path: `current` is re-pointed on every update
+  path.join(os.homedir(), ".paperclip/cli/current/node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js");
+const list = (v, d) => (v ?? d).split(",").map((s) => s.trim()).filter(Boolean);
+const die = (m) => { console.error(`hermes-sandbox: ${m}`); process.exit(127); };
+const home = os.homedir(), BWRAP = "/usr/bin/bwrap";
+const ROOTS = [`${home}/projects`, `${home}/.paperclip/instances/default/workspaces`, `${home}/.paperclip/instances/default/projects`];
+const DROP = /^(BASH_FUNC_.*|BASH_ENV|SHELLOPTS|BASHOPTS|PS4|PYTHON.*|LD_.*)$/;
+
+(async () => {
+  const mod = await import(UTILS).catch((e) => die(`cannot import ${UTILS}: ${e.message}`));
+  if (typeof mod.buildLocalProcessSandboxSpawnTarget !== "function") die(`buildLocalProcessSandboxSpawnTarget missing in ${UTILS}; Paperclip changed, re-check this wrapper`);
+
+  const e = process.env, project = fs.realpathSync(process.cwd());
+  if (!ROOTS.some((r) => project.startsWith(r + "/"))) die(`refusing to run: cwd ${project} is not inside an allowed root`);
+  const hermesHome = path.resolve(e.HERMES_SANDBOX_HOME || path.join(project, ".hermes-home"));
+  fs.mkdirSync(hermesHome, { recursive: true });
+  const bin = e.HERMES_SANDBOX_BIN || "hermes";
+  const exe = bin.includes("/") ? bin : (e.PATH || "").split(":").filter(Boolean).map((d) => path.join(d, bin)).find((p) => fs.existsSync(p));
+  if (!exe) die(`command not found: ${bin}`);
+
+  // Allowlisted env only: PATH, HOME, run identity + Paperclip API, model key, HERMES_HOME.
+  const env = { PATH: "/usr/local/bin:/usr/bin:/bin", HOME: project, HERMES_HOME: hermesHome, LANG: "C.UTF-8" };
+  for (const k of Object.keys(e)) if (/^PAPERCLIP_(API_|RUN_ID$|AGENT_ID$|COMPANY_ID$|TASK_ID$|WAKE_)/.test(k) && k !== "PAPERCLIP_WAKE_PAYLOAD_JSON") env[k] = e[k];
+  for (const k of list(e.HERMES_SANDBOX_PASS, "OPENROUTER_API_KEY")) if (e[k] !== undefined) env[k] = e[k];
+  delete env.PAPERCLIP_AGENT_JWT_SECRET;   // belt and braces; the regex above never matches it
+
+  const hh = path.join(home, ".hermes");
+  const target = await mod.buildLocalProcessSandboxSpawnTarget({
+    executable: exe, args: process.argv.slice(2), cwd: project,
+    options: {
+      command: BWRAP, filesystemScope: "workspace", workspaceDir: project, networkScope: "allowlist",
+      networkAllowlist: mod.parseLocalProcessNetworkAllowlist(list(e.HERMES_SANDBOX_ALLOW, "")),
+      managedPaths: [{ path: hermesHome, access: "rw" }],
+      extraPaths: list(e.HERMES_SANDBOX_RO, `${hh}/hermes-agent,${hh}/tools`).map((p) => ({ path: p, access: "ro" })),
+    },
+  });
+  for (const [k, v] of Object.entries(target.env)) v === undefined ? delete env[k] : (env[k] = v);
+  for (const k of Object.keys(env)) if (DROP.test(k)) delete env[k];   // after the merge, so nothing can re-add them
+  const child = spawn(target.command, target.args, { cwd: target.cwd, env, stdio: "inherit" });
+  for (const s of ["SIGTERM", "SIGINT"]) process.on(s, () => child.kill(s));
+  child.on("exit", async (code, sig) => { await target.cleanup?.(); sig ? process.kill(process.pid, sig) : process.exit(code ?? 1); });
+})().catch((err) => die(err.stack || err.message));

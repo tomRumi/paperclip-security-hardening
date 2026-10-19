@@ -1,0 +1,18 @@
+--- a/node_modules/@paperclipai/server/dist/services/authorization.js
++++ b/node_modules/@paperclipai/server/dist/services/authorization.js
+@@ -1675,6 +1675,15 @@
+                     return grantDecision;
+                 return denyRestrictedAssignmentPolicy(policyEffect);
+             }
++            // LOCAL-PATCH 0013: no simple-mode default for agents assigning work to ANOTHER agent or to a board user.
++            // Such an assignment (create / child-create / PATCH assignee / suggested tasks) needs an explicit tasks:assign or
++            // tasks:assign_scope grant row. Self-assignment and unassigned issues keep the default-open rule.
++            if (input.resource.assigneeUserId ||
++                (input.resource.assigneeAgentId && input.resource.assigneeAgentId !== actorAgentId)) {
++                const explicitAssignGrant = await decideWithTaskAssignmentGrants("agent", actorAgentId);
++                if (!explicitAssignGrant.allowed)
++                    return explicitAssignGrant;
++            }
+             if (trustResolution.kind === "standard")
+                 return decideVisibleIssueWrite();
+             return allow({

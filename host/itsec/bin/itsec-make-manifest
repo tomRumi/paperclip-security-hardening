@@ -1,0 +1,81 @@
+#!/usr/bin/python3 -I
+"""itsec-make-manifest: ADMIN step (root, at install time and after every deliberate Paperclip update + apply.sh).
+Writes /etc/itsec/patch-manifest.json: for each patched Paperclip file its sha256 and the LOCAL-PATCH markers that must
+be present. Reads the files only; never executes anything. Refuses to record a file that lacks a marker (= unpatched).
+
+  sudo /opt/itsec/bin/itsec-make-manifest --tree /home/paperclip/.paperclip/cli/current
+  sudo /opt/itsec/bin/itsec-make-manifest --out /tmp/m.json --target /path/file.js='// LOCAL-PATCH 0002'
+
+Run it only after `apply.sh --check` (run by the owner/admin, never by itsec) says all patches are applied.
+The manifest keys are the paths exactly as given (the .../cli/current symlink form is the one the collector reads, so a
+Paperclip version switch changes the hashes and raises HIGH until the manifest is regenerated on purpose)."""
+import argparse
+import hashlib
+import json
+import os
+import sys
+import tempfile
+
+TREE_TARGETS = [   # same table as patches/apply.sh (a test keeps them identical)
+    ("node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js", ["// LOCAL-PATCH 0001", "// LOCAL-PATCH 0004", "// LOCAL-PATCH 0006", "// LOCAL-PATCH 0012"]),
+    ("node_modules/@paperclipai/server/dist/routes/agents.js", ["// LOCAL-PATCH 0002", "// LOCAL-PATCH 0005c", "// LOCAL-PATCH 0009", "// LOCAL-PATCH 0011", "// LOCAL-PATCH 0013"]),
+    ("node_modules/@paperclipai/server/dist/routes/pipelines.js", ["// LOCAL-PATCH 0007"]),
+    ("node_modules/@paperclipai/server/dist/services/heartbeat.js", ["// LOCAL-PATCH 0003", "// LOCAL-PATCH 0005b", "// LOCAL-PATCH 0006"]),
+    ("node_modules/@paperclipai/server/dist/services/agents.js", ["// LOCAL-PATCH 0005a", "// LOCAL-PATCH 0008"]),
+    ("node_modules/@paperclipai/server/dist/services/company-portability.js", ["// LOCAL-PATCH 0005d"]),
+    ("node_modules/@paperclipai/server/dist/services/agent-permissions.js", ["// LOCAL-PATCH 0005e"]),
+    ("node_modules/@paperclipai/server/dist/services/built-in-agents.js", ["// LOCAL-PATCH 0010"]),
+    ("node_modules/@paperclipai/server/dist/services/authorization.js", ["// LOCAL-PATCH 0013"]),
+    ("node_modules/@paperclipai/shared/dist/validators/agent.js", ["// LOCAL-PATCH 0011"]),
+]
+# apply.sh skips these for Paperclip versions that do not need them (0005e: not needed for 2026.1005.0).
+OPTIONAL_MARKERS = {"// LOCAL-PATCH 0005e"}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="/etc/itsec/patch-manifest.json")
+    ap.add_argument("--tree", help="Paperclip install dir (e.g. ~/.paperclip/cli/current); uses the built-in target table")
+    ap.add_argument("--target", action="append", default=[], metavar="PATH=MARKER", help="explicit file and marker (repeatable)")
+    a = ap.parse_args()
+    want = {}
+    if a.tree:
+        for rel, markers in TREE_TARGETS:
+            want.setdefault(os.path.join(a.tree, rel), []).extend(markers)
+    for t in a.target:
+        path, _, marker = t.partition("=")
+        if not path or not marker:
+            sys.exit(f"bad --target {t!r}")
+        want.setdefault(path, []).append(marker)
+    if not want:
+        sys.exit("give --tree or --target")
+    manifest = {}
+    for path, markers in sorted(want.items()):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            if all(m in OPTIONAL_MARKERS for m in markers):
+                print(f"{path}: only optional marker(s), file absent for this Paperclip version; not recorded", file=sys.stderr)
+                continue
+            sys.exit(f"cannot read {path}: {e.strerror}")
+        optional = [m for m in markers if m in OPTIONAL_MARKERS and m.encode() not in data]
+        markers = [m for m in markers if m not in optional]
+        if not markers:
+            print(f"{path}: only optional marker(s) {optional}, not present for this Paperclip version; not recorded", file=sys.stderr)
+            continue
+        missing = [m for m in markers if m.encode() not in data]
+        if missing:
+            sys.exit(f"{path}: marker(s) {missing} not found; apply the patches first (apply.sh), then re-run")
+        manifest[path] = {"sha256": hashlib.sha256(data).hexdigest(), "markers": sorted(set(markers))}
+    d = os.path.dirname(os.path.abspath(a.out))
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".manifest-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(manifest, f, indent=1, sort_keys=True)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, a.out)
+    print(f"wrote {a.out}: {len(manifest)} files")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,11 @@
+--- a/node_modules/@paperclipai/server/dist/services/company-portability.js
++++ b/node_modules/@paperclipai/server/dist/services/company-portability.js
+@@ -4926,7 +4926,7 @@
+                         status: pauseAutomations ? "paused" : "idle",
+                     });
+                     await access.ensureMembership(targetCompany.id, "agent", created.id, "member", "active");
+-                    await access.setPrincipalPermission(targetCompany.id, "agent", created.id, "tasks:assign", true, actorUserId ?? null);
++                    // LOCAL-PATCH 0005d: imported agents get no default tasks:assign grant.
+                     try {
+                         const materialized = await instructions.materializeManagedBundle(created, bundleFiles, {
+                             clearLegacyPromptTemplate: true,

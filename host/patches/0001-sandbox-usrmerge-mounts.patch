@@ -1,0 +1,37 @@
+--- a/node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js
++++ b/node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js
+@@ -20,6 +20,9 @@
+     "/etc/timezone",
+     "/etc/gitconfig",
+ ];
++// LOCAL-PATCH 0001: the /bin,/sbin,/lib,/lib64 symlinks are created with --symlink below; on usr-merged hosts
++// these are symlinks into /usr and must not also be bind-mounted over the new symlink (bwrap fails).
++const USR_MERGE_SYMLINK_PATHS = new Set(["/bin", "/sbin", "/lib", "/lib64"]);
+ const PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"];
+ const SANDBOX_PROXY_PORT = 31_337;
+ const UNIX_SOCKET_PATH_MAX_BYTES = 107;
+@@ -34,6 +37,14 @@
+ async function pathExists(candidate) {
+     return fs.lstat(candidate).then(() => true).catch(() => false);
+ }
++// LOCAL-PATCH 0001
++async function isUsrMergeSymlink(candidate) {
++    const stat = await fs.lstat(candidate).catch(() => null);
++    if (!stat?.isSymbolicLink())
++        return false;
++    const resolved = await fs.realpath(candidate).catch(() => null);
++    return resolved !== null && resolved.startsWith("/usr/");
++}
+ function parentDirectories(candidate) {
+     const directories = [];
+     let current = path.dirname(candidate);
+@@ -325,6 +336,9 @@
+             const normalized = normalizeAbsolutePath(source, "Sandbox path");
+             if (mounted.has(normalized) || !(await pathExists(normalized)))
+                 return;
++            // LOCAL-PATCH 0001: already provided by the --symlink above when the host path is a usr-merge symlink into /usr.
++            if (USR_MERGE_SYMLINK_PATHS.has(normalized) && await isUsrMergeSymlink(normalized))
++                return;
+             addParentDirectories(args, created, normalized);
+             args.push(access === "rw" ? "--bind" : "--ro-bind", normalized, normalized);
+             mounted.add(normalized);

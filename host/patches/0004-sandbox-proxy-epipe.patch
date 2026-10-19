@@ -1,0 +1,25 @@
+--- a/node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js
++++ b/node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js
+@@ -211,6 +211,8 @@
+             upstreamResponse.pipe(response);
+         });
+         upstream.on("error", (error) => response.destroy(error));
++        request.on("error", () => upstream.destroy()); // LOCAL-PATCH 0004
++        response.on("error", () => upstream.destroy()); // LOCAL-PATCH 0004
+         request.pipe(upstream);
+     });
+     server.on("connect", (request, clientSocket, head) => {
+@@ -229,11 +231,13 @@
+             clientSocket.pipe(upstream);
+         });
+         upstream.on("error", () => clientSocket.destroy());
++        clientSocket.on("error", () => upstream.destroy()); // LOCAL-PATCH 0004: a client reset must not become an uncaughtException
+         clientSocket.on("close", () => upstream.destroy());
+     });
+     const sockets = new Set();
+     server.on("connection", (socket) => {
+         sockets.add(socket);
++        socket.on("error", () => socket.destroy()); // LOCAL-PATCH 0004
+         socket.on("close", () => sockets.delete(socket));
+     });
+     await new Promise((resolve, reject) => {

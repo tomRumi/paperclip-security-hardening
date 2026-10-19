@@ -1,0 +1,31 @@
+#!/usr/bin/python3 -I
+"""itsec-report: daily report (06:00 UTC). Usage: itsec-report [--config F] [--print]"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+from itsec import report as R                          # noqa: E402
+from itsec.core import State, load_config               # noqa: E402
+from itsec.notify import build_notifier                 # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=os.environ.get("ITSEC_CONFIG", "/etc/itsec/config.json"))
+    ap.add_argument("--print", action="store_true", help="print the report instead of delivering it")
+    a = ap.parse_args()
+    cfg = load_config(a.config if os.path.exists(a.config) else None)
+    state = State(cfg["state_dir"])
+    notifier = build_notifier(cfg)
+    if a.print:
+        notifier.send = lambda alert: (print(alert["title"] + "\n\n" + alert["body"]) or True, "printed")
+    body, ok, ai, info = R.make_report(cfg, state, notifier)
+    if not a.print:
+        state.save()
+    print(f"delivered={ok} ai_summary={ai} info={info}")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

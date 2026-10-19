@@ -1,0 +1,16 @@
+--- a/node_modules/@paperclipai/server/dist/routes/agents.js
++++ b/node_modules/@paperclipai/server/dist/routes/agents.js
+@@ -4133,6 +4133,13 @@
+                 res.status(403).json({ error: "Only CEO can manage permissions" });
+                 return;
+             }
++            // LOCAL-PATCH 0009: an agent (even the CEO) may not grant canCreateAgents or tasks:assign, on any agent incl. itself;
++            // those changes are board-only. Reducing them (false) and the other permission fields stay allowed.
++            if (req.body.canCreateAgents === true || req.body.canAssignTasks === true) {
++                logger.warn({ event: "agent_permissions_grant_denied", agentId: actorAgent.id, targetAgentId: id, runId: req.actor.runId ?? null, canCreateAgents: req.body.canCreateAgents === true, canAssignTasks: req.body.canAssignTasks === true }, "agent permissions update denied: granting canCreateAgents/canAssignTasks is board-only");
++                res.status(403).json({ error: "Granting canCreateAgents or canAssignTasks requires a board user", code: "permissions_grant_board_only" });
++                return;
++            }
+         }
+         else {
+             await assertBoardCanManageAgentsForCompany(req, existing.companyId);

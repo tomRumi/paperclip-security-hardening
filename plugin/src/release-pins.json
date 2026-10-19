@@ -1,0 +1,8 @@
+{
+  "comment": "Written by scripts/release.sh for a release build. All null in a development checkout: the Watchdog and Hermes rows then show no install command.",
+  "version": null,
+  "baseUrl": null,
+  "installWatchdogSha256": null,
+  "installHermesSha256": null,
+  "hermesWrapperSha256": null
+}

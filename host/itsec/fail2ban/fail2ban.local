@@ -1,0 +1,4 @@
+# TEMPLATE for /etc/fail2ban/fail2ban.local. Ubuntu's fail2ban.conf logs to /var/log/fail2ban.log, so "[sshd] Ban"
+# never reached the journal and the itsec rule fail2ban-ban could not fire. Log to the journal instead.
+[Definition]
+logtarget = SYSTEMD-JOURNAL

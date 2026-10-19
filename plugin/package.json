@@ -1,0 +1,53 @@
+{
+  "name": "paperclip-sandbox-hardening",
+  "version": "0.1.0",
+  "description": "Paperclip plugin: one switch per sandbox protection (rebuilt from Paperclip's original files, one restart per save), Agent boxes with daily token caps, a self-test after every restart, and one-line installs for the watchdog and the Hermes wrapper.",
+  "type": "module",
+  "license": "MIT",
+  "author": "<copyright holder>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/<org>/paperclip-sandbox-hardening.git",
+    "directory": "plugin"
+  },
+  "homepage": "https://github.com/<org>/paperclip-sandbox-hardening#readme",
+  "bugs": {
+    "url": "https://github.com/<org>/paperclip-sandbox-hardening/issues"
+  },
+  "os": [
+    "linux"
+  ],
+  "keywords": [
+    "paperclip",
+    "paperclip-plugin",
+    "sandbox",
+    "bwrap",
+    "hardening",
+    "security",
+    "ai-agents",
+    "token-caps"
+  ],
+  "scripts": {
+    "validate-manifest": "node ./scripts/validate-manifest.mjs",
+    "test": "node --test test/*.test.js test/*.test.mjs",
+    "prepack": "node ./scripts/copy-patches.mjs",
+    "postpack": "node ./scripts/copy-patches.mjs --clean"
+  },
+  "paperclipPlugin": {
+    "manifest": "./src/manifest.js",
+    "worker": "./src/worker.js",
+    "ui": "./src/ui.js"
+  },
+  "dependencies": {
+    "@paperclipai/plugin-sdk": "2026.1005.0",
+    "@paperclipai/shared": "2026.1005.0"
+  },
+  "files": [
+    "src",
+    "bin",
+    "scripts",
+    "patches",
+    "README.md",
+    "LICENSE"
+  ]
+}
