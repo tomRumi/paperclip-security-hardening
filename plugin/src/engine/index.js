@@ -89,7 +89,8 @@ export function createEngine(options = {}) {
   const protectionFiles = (p) => [...new Set(p.patches.map((id) => catalog[id].rel).filter(Boolean))];
 
   // ---- dependencies
-  const withRequirements = (ids) => {
+  // soft: also follow `softRequires` (switched on together by default). Only the hard ones make a protection unavailable.
+  const withRequirements = (ids, { soft = true } = {}) => {
     const out = new Set();
     const visit = (id) => {
       if (out.has(id)) return;
@@ -97,11 +98,13 @@ export function createEngine(options = {}) {
       if (!p) throw new Error(`unknown protection "${id}" (known: ${PROTECTIONS.map((x) => x.id).join(", ")})`);
       out.add(id);
       p.requires.forEach(visit);
+      if (soft) (p.softRequires ?? []).forEach(visit);
     };
     ids.forEach(visit);
     return out;
   };
   const dependsOn = (a, b) => a !== b && withRequirements([a]).has(b);
+  const hardDependsOn = (a, b) => a !== b && withRequirements([a], { soft: false }).has(b);
 
   function build(rel, pristine, ids) {
     const key = `${rel}\0${sha256(pristine)}\0${ids.join(",")}`;
@@ -159,7 +162,7 @@ export function createEngine(options = {}) {
     const markUnavailable = (id, reason) => {
       if (unavailable[id]) return;
       unavailable[id] = reason;
-      for (const other of closure) if (dependsOn(other, id)) markUnavailable(other, `needs "${getProtection(id).title}", which is unavailable on this install`);
+      for (const other of closure) if (hardDependsOn(other, id)) markUnavailable(other, `needs "${getProtection(id).title}", which is unavailable on this install`);
     };
     for (const id of order(closure)) {
       for (const pid of getProtection(id).patches) {
@@ -170,6 +173,7 @@ export function createEngine(options = {}) {
       }
     }
     const skipped = new Set();
+    const upstream = new Set(); // patches whose change Paperclip's own code now contains (skipped too)
     let built;
     for (let round = 0; ; round++) {
       if (round > 100) throw new Error("plan did not converge");
@@ -184,6 +188,7 @@ export function createEngine(options = {}) {
         const b = build(rel, f.pristine, ids);
         if (!b.ok) {
           if (catalog[b.failedId].optional) skipped.add(b.failedId);
+          else if (b.upstream) { skipped.add(b.failedId); upstream.add(b.failedId); }
           else markUnavailable(catalog[b.failedId].protection, b.reason);
           retry = true;
           break;
@@ -217,6 +222,12 @@ export function createEngine(options = {}) {
     };
     const effective = (p) => state.applied.includes(p.id)
       && protectionFiles(p).every((rel) => state.files[rel]?.builtSha && state.files[rel].builtSha === files[rel].currentSha && patchesCurrent(p, rel));
+    // Is the protection in the files right now (the file is what the engine built last time, with this protection's patches in it)?
+    // Rebuilding without it then removes it from a running tree; on files an update already made stock there is nothing to remove.
+    const inEffect = (p) => state.applied.includes(p.id) && protectionFiles(p).some((rel) => {
+      const rec = state.files[rel];
+      return rec?.builtSha && rec.builtSha === files[rel].currentSha && (rec.patches ?? []).some((id) => p.patches.includes(id));
+    });
     const protections = PROTECTIONS.map((p) => {
       const on = closure.has(p.id);
       let action;
@@ -225,16 +236,25 @@ export function createEngine(options = {}) {
       else if (on) action = effective(p) ? "unchanged" : "will-apply";
       else action = state.applied.includes(p.id) ? "will-remove" : "unchanged";
       return { id: p.id, title: p.title, kind: p.kind, core: p.core, enabled: on, action, reason: unavailable[p.id] ?? null,
+        inEffect: action === "unavailable" && inEffect(p),
+        upstreamPatches: p.patches.filter((id) => upstream.has(id)),
         skippedPatches: p.patches.filter((id) => skipped.has(id) || (catalog[id].optional && catalog[id].candidates.length === 0)) };
     });
     const result = {
       createdAt: new Date().toISOString(), tree, paperclipVersion: version, vkey, patchesDir,
       requested: desired, enabled: order(closure), added, neededOff, unavailable,
       // A core protection leaves the files in two ways: switched off (will-remove), or switched on but no longer fitting this Paperclip while
-      // it is applied now (an update changed the code its patches change): rebuilding then would silently drop it, which counts as switching
-      // it off. Either way the owner confirms; `unavailable` tells the two apart (and `reason` says why it no longer fits).
-      confirmationNeeded: protections.filter((p) => p.core && (p.action === "will-remove" || (p.action === "unavailable" && state.applied.includes(p.id))))
+      // it is IN the files now (new patch files that do not fit the tree the engine built): rebuilding then would silently drop it, which
+      // counts as switching it off. Either way the owner confirms; `unavailable` tells the two apart (and `reason` says why it no longer fits).
+      // A protection that no longer fits files an update already made stock is not in the files: nothing is dropped, it is just skipped
+      // (see `unfitting`), and everything that still fits is applied.
+      confirmationNeeded: protections.filter((p) => p.core && (p.action === "will-remove" || p.inEffect))
         .map((p) => ({ id: p.id, title: p.title, risk: getProtection(p.id).risk ?? null, unavailable: p.action === "unavailable", reason: p.action === "unavailable" ? p.reason : null })),
+      // Switched-on protections (available ones) whose change is now part of Paperclip itself: no longer needed, informational only.
+      nowUpstream: protections.filter((p) => p.enabled && p.action !== "unavailable" && p.upstreamPatches.length)
+        .map((p) => ({ id: p.id, title: p.title, patches: p.upstreamPatches })),
+      // Switched-on core protections that do not fit this Paperclip (skipped, still enabled), with what the owner should be told.
+      unfitting: protections.filter((p) => p.core && p.action === "unavailable").map((p) => ({ id: p.id, title: p.title, risk: getProtection(p.id).risk ?? null, reason: p.reason, held: p.inEffect })),
       protections, files: fileEntries, changes: fileEntries.filter((f) => f.change).length,
     };
     result.restartNeededAfterApply = result.changes > 0;

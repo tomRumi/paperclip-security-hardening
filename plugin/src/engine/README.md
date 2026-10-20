@@ -5,7 +5,7 @@ Node 20+ built-ins only (`fs`, `path`, `crypto`, `child_process`), plus GNU `pat
 
 | File | Role |
 |---|---|
-| `registry.js` | The protections (id, owner-facing title/description, patch ids, `requires`, `core` + `risk`, `kind`) and the patch table (marker, `notNeededOn`) |
+| `registry.js` | The protections (id, owner-facing title/description, patch ids, `requires` (hard: the protection is unavailable too when one does not fit) and `softRequires` (switched on together, but not needed), `core` + `risk`, `kind`) and the patch table (marker, `notNeededOn`) |
 | `patches.js` | Finds patch files, orders variants, trial-builds one file with `patch -p1 -N -F0` (dry run, then real, then marker check) in a temp dir |
 | `store.js` | Data dir: pristine copies, `state.json`, `events.jsonl`; atomic writes |
 | `target.js` | Which Paperclip install the engine works on: derived from the running server process (`/proc/<pid>`), strict, see "Which Paperclip" below |
@@ -42,7 +42,7 @@ await engine.restoreAll({ force });                                     // put e
   protection, or reworks a patch file, therefore shows `will-apply` for that protection only, and only it is marked as
   waiting for the restart. A state written before `patchShas` existed has no hash to compare: any planned change of the file
   counts for the protections on it.
-  `confirmationNeeded` lists the core protections being switched off, with their `risk`, and the core protections that are applied now but no longer fit this Paperclip (`unavailable: true`, with the `reason`): rebuilding would drop them, which counts as switching them off.
+  `confirmationNeeded` lists the core protections being switched off, with their `risk`, and the core protections that are IN the files now (`inEffect`) but no longer fit (`unavailable: true`, with the `reason`): rebuilding would drop them, which counts as switching them off. A core protection that does not fit files that are stock again (a Paperclip update) drops nothing: it is listed in `unfitting` (skipped, still enabled) and everything else is applied. `nowUpstream` lists protections with a patch that does not apply forward but whose change, without our comments, reverse-applies cleanly to the file: Paperclip contains it itself, the patch is skipped and the protection counts as satisfied.
   - `repair`: a built file edited outside the engine is rebuilt from its stored original. Without it, that file is
     left alone and its protections are unavailable.
   - `adoptOrig`: takes over files patched by `apply.sh` with different patch files, using the `.orig` next to each one.

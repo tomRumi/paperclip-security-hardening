@@ -24,7 +24,7 @@
      const targetIsSandbox = target?.kind === "remote" && target.transport === "sandbox";
      const cwd = resolveAdapterExecutionTargetCwd(target, asString(config.cwd, ""), process.cwd());
      const targetLabel = targetIsRemote
-@@ -95,7 +101,41 @@
+@@ -95,7 +101,47 @@
      }
      // Prevent OpenCode from writing an opencode.json into the working directory.
      env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
@@ -55,6 +55,12 @@
 +            });
 +        }
 +    }
++    else if (!targetIsRemote) {
++        // LOCAL-PATCH 0019d: a probe without scopes is not boxed, so it does not run in the server's working directory (or in a workspace the agent
++        // writes) either: it gets an empty private directory, removed afterwards.
++        boxDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-envtest-cwd-"));
++        probeCwd = boxDir;
++    }
 +    let preparedRuntimeConfig;
 +    try {
 +        preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config, boxedRuntimeDir: boxState?.runtimeDir });
@@ -67,7 +73,7 @@
      const localRuntimeConfigHome = preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
      if (asBoolean(config.dangerouslySkipPermissions, true)) {
          checks.push({
-@@ -110,8 +150,29 @@
+@@ -110,8 +156,29 @@
      // `fs.mkdtemp` directory leaks on the early-throw path.
      let preparedRuntimeWorkspaceLocalDir = null;
      try {
@@ -98,7 +104,7 @@
          if (targetIsRemote) {
              preparedRuntimeWorkspaceLocalDir = await fs.mkdtemp(path.join(os.tmpdir(), `paperclip-opencode-envtest-${runId}-`));
              const preparedExecutionTargetRuntime = await prepareAdapterExecutionTargetRuntime({
-@@ -186,7 +247,7 @@
+@@ -186,7 +253,7 @@
                  });
              }
          }
@@ -107,7 +113,7 @@
          let modelValidationPassed = false;
          const configuredModel = asString(config.model, "").trim();
          // Model discovery and validation use local child processes against
-@@ -204,7 +265,7 @@
+@@ -204,7 +271,7 @@
          }
          else if (canRunProbe && configuredModel) {
              try {
@@ -116,7 +122,7 @@
                  if (discovered.length > 0) {
                      checks.push({
                          code: "opencode_models_discovered",
-@@ -244,7 +305,7 @@
+@@ -244,7 +311,7 @@
          }
          else if (!targetIsRemote && canRunProbe && !configuredModel) {
              try {
@@ -125,7 +131,7 @@
                  if (discovered.length > 0) {
                      checks.push({
                          code: "opencode_models_discovered",
-@@ -283,8 +344,9 @@
+@@ -283,8 +350,9 @@
                  await ensureOpenCodeModelConfiguredAndAvailable({
                      model: configuredModel,
                      command,
@@ -136,7 +142,7 @@
                  });
                  checks.push({
                      code: "opencode_model_configured",
-@@ -325,6 +387,7 @@
+@@ -325,6 +393,7 @@
                  const probe = await runAdapterExecutionTargetProcess(runId, runtimeTarget, command, args, {
                      cwd: runtimeCwd,
                      env: runtimeEnv,
@@ -144,7 +150,7 @@
                      timeoutSec: helloProbeTimeoutSec,
                      graceSec: 5,
                      stdin: "Respond with hello.",
-@@ -405,6 +468,8 @@
+@@ -405,6 +474,8 @@
              await fs.rm(preparedRuntimeWorkspaceLocalDir, { recursive: true, force: true }).catch(() => { });
          }
          await preparedRuntimeConfig.cleanup();

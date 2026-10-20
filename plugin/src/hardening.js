@@ -27,10 +27,17 @@ export const CONFIG_STATE_KEY = Object.freeze({ scopeKind: "instance", stateKey:
 export const SELFTEST_KEY = Object.freeze({ scopeKind: "instance", stateKey: "selftest" });
 /** Last "target unknown" alert raised: {code} (cleared once the target resolves again). */
 export const TARGET_ALERT_KEY = Object.freeze({ scopeKind: "instance", stateKey: "target-alert" });
-/** Set while a Paperclip update (or a new patch set) left a switched-on core protection that no longer fits and the plugin therefore
- *  rebuilt nothing: {at, paperclipVersion, signature, alerted, protections: [{id, title, risk, reason}]}. Cleared by the next start that
- *  can apply everything, or by an admin's Save (which asks for the confirmation). */
+/** Set while a Paperclip update (or a new patch set) left a switched-on core protection that no longer fits:
+ *  {at, paperclipVersion, signature, alerted, held, accepted, protections: [{id, title, risk, reason, held}]}. Every protection that still
+ *  fits is applied anyway; the one that does not is skipped but stays enabled. `held` = the protection is in the files now and the rebuild
+ *  would remove it: then nothing is rebuilt at all until an admin decides (Save asks for the confirmation). Cleared by the next start that
+ *  finds everything fitting; `accepted` = an admin confirmed dropping it (no new alert for the same set and version). */
 export const UPDATE_DECISION_KEY = Object.freeze({ scopeKind: "instance", stateKey: "update-decision" });
+/** Protections whose change Paperclip now contains itself (informational heads-up, no alert): {signature, at, paperclipVersion, protections: [{id, title, patches}]}. */
+export const UPSTREAM_KEY = Object.freeze({ scopeKind: "instance", stateKey: "now-upstream" });
+/** Set once the HIGH alert for "the instance runs in local_trusted mode" was raised ({alerted: true}); cleared when it does not any more. */
+export const LOCAL_TRUSTED_KEY = Object.freeze({ scopeKind: "instance", stateKey: "local-trusted-alert" });
+export const LOCAL_TRUSTED_TEXT = "This Paperclip runs in local_trusted mode: any caller without a token is treated as the board, including a boxed agent that reaches the server's API (for example on localhost). The sandbox cannot make such a call safe.";
 const PLACEHOLDER_NOTE = "coming in a later step";
 /** Protections whose patched code reads the settings file (a settings change needs a restart while they are on). */
 const READS_CONFIG = ["own-box", "safe-defaults"];
@@ -256,32 +263,68 @@ export function createHardening({ ctx, engineOptions = {}, resolveTargetFn = res
   }
 
   /**
-   * A switched-on core protection that is applied now no longer fits the Paperclip files (an update changed the code its patches
-   * change): rebuilding would drop it silently. That is treated like switching it off, which needs the owner's confirmation, so the
-   * automatic re-apply stops here: nothing is rebuilt, a HIGH alert is raised (once per set of protections and Paperclip version) and the
-   * Hardening page shows "update needs admin decision". The admin decides on the page (Save asks for the confirmation) or brings a
-   * plugin release whose patches fit.
+   * Switched-on core protections that do not fit the Paperclip files (an update changed the code their patches change). They are skipped but
+   * stay switched on; everything that still fits is applied by start(). A HIGH alert is raised (once per set of protections and Paperclip
+   * version) and the Hardening page shows "update needs admin decision" on their rows. Exception (`held`): a protection that is IN the files
+   * now (new patch files that do not fit the tree the engine built): rebuilding would drop it silently, which needs the owner's confirmation
+   * like a switch-off, so then nothing is rebuilt (start() returns needsDecision).
    */
-  async function holdForDecision(plan, settings) {
-    const items = plan.confirmationNeeded.map((c) => ({ id: c.id, title: c.title, risk: c.risk ?? null, reason: c.reason ?? null }));
-    const signature = `${items.map((i) => i.id).sort().join(",")}@${plan.paperclipVersion ?? "?"}`;
+  async function reportUnfitting(plan, settings) {
+    const items = plan.unfitting.map((c) => ({ id: c.id, title: c.title, risk: c.risk ?? null, reason: c.reason ?? null, held: c.held }));
+    const held = items.some((i) => i.held);
+    const signature = decisionSignature(plan);
     const prev = await ctx.state.get(UPDATE_DECISION_KEY).catch(() => null);
     const same = prev?.signature === signature;
     const names = items.map((i) => i.title).join(", ");
-    log.error(`protections NOT re-applied, nothing was rebuilt: ${names} no longer fit this Paperclip (${plan.paperclipVersion ?? "unknown version"}) and need an admin decision`);
+    const ids = items.map((i) => i.id);
+    if (same && prev.accepted) {
+      log.warn(`not fitting this Paperclip (accepted by an admin): ${names}`);
+      return { held: false };
+    }
+    if (held) log.error(`protections NOT re-applied, nothing was rebuilt: ${names} no longer fit this Paperclip (${plan.paperclipVersion ?? "unknown version"}) and need an admin decision`);
+    else log.error(`${names} no longer fit this Paperclip (${plan.paperclipVersion ?? "unknown version"}); skipped (still switched on), every other protection that fits is applied: update needs admin decision`);
     let alerted = same ? Boolean(prev.alerted) : false;
     if (!alerted) {
-      const lines = items.map((i) => `- **${i.title}**: ${i.reason ?? "does not fit"}${i.risk ? ` If it is dropped: ${i.risk}` : ""}`);
-      const a = await raiseAlertIssue({ ctx, settings, priority: "high", metadata: { source: "update-needs-decision", protections: items.map((i) => i.id), paperclipVersion: plan.paperclipVersion ?? null },
+      const lines = items.map((i) => `- **${i.title}**: ${i.reason ?? "does not fit"}${i.risk ? ` If it is not in the files: ${i.risk}` : ""}`);
+      const claudeNote = ids.includes("box-claude") && !ids.includes("only-boxed")
+        ? " \"Only boxed agents run\" is applied without it, so Claude agents are refused (they are not registered as boxed) until a plugin release for this Paperclip brings \"Box Claude agents\" back."
+        : "";
+      const tail = held
+        ? "Rebuilding the files would have removed them silently, so the plugin changed NOTHING: no protection was re-applied by this start. The files stay as they are. "
+          + "Open the Hardening page (status \"update needs admin decision\"): install a plugin release that carries patches for this Paperclip, or Save to rebuild without the listed protections after confirming that you accept the risk."
+        : "The plugin applied every other protection that still fits; the listed ones are skipped but stay switched on, so they come back as soon as a plugin release fits this Paperclip. Until then they are NOT in the files."
+          + `${claudeNote} Open the Hardening page (status "update needs admin decision") and install a plugin release that carries patches for this Paperclip.`;
+      const a = await raiseAlertIssue({ ctx, settings, priority: "high", metadata: { source: "update-needs-decision", protections: ids, paperclipVersion: plan.paperclipVersion ?? null },
         title: `[Security hardening] Paperclip update: ${names} no longer fit${items.length === 1 ? "s" : ""}, admin decision needed`.slice(0, 240),
-        description: `On start the plugin found switched-on safety protections that no longer fit the Paperclip files (version ${plan.paperclipVersion ?? "unknown"}):\n\n${lines.join("\n")}\n\n`
-          + "Rebuilding the files would have removed them silently, so the plugin changed NOTHING: no protection was re-applied by this start. The files stay as they are, which means that after a Paperclip update that replaced them none of the protections is in the files until you act. "
-          + "Open the Hardening page (status \"update needs admin decision\"): install a plugin release that carries patches for this Paperclip, or Save to rebuild without the listed protections after confirming that you accept the risk." });
+        description: `On start the plugin found switched-on safety protections that no longer fit the Paperclip files (version ${plan.paperclipVersion ?? "unknown"}):\n\n${lines.join("\n")}\n\n${tail}` });
       alerted = a.ok;
     }
-    await ctx.state.set(UPDATE_DECISION_KEY, { at: same && prev.at ? prev.at : new Date().toISOString(), paperclipVersion: plan.paperclipVersion ?? null, signature, alerted, protections: items }).catch(() => {});
-    await logActivity(null, settings, `Security hardening: update needs admin decision (${names}); nothing was re-applied`, { protections: items.map((i) => i.id), paperclipVersion: plan.paperclipVersion ?? null });
-    return { ok: false, applied: false, needsDecision: true, protections: items.map((i) => i.id), error: `${names} no longer fit${items.length === 1 ? "s" : ""} this Paperclip; nothing was rebuilt` };
+    await ctx.state.set(UPDATE_DECISION_KEY, { at: same && prev.at ? prev.at : new Date().toISOString(), paperclipVersion: plan.paperclipVersion ?? null, signature, alerted, held, accepted: false, protections: items }).catch(() => {});
+    await logActivity(null, settings, `Security hardening: update needs admin decision (${names}); ${held ? "nothing was re-applied" : "the rest was re-applied"}`, { protections: ids, paperclipVersion: plan.paperclipVersion ?? null, held });
+    return { held };
+  }
+  /** Heads-up (no alert): the change of a protection is now part of Paperclip, the protection counts as satisfied. Logged once per set and version. */
+  async function noteUpstream(plan, settings) {
+    if (!plan.nowUpstream.length) { await ctx.state.set(UPSTREAM_KEY, null).catch(() => {}); return; }
+    const signature = `${plan.nowUpstream.map((u) => `${u.id}:${u.patches.join("+")}`).sort().join(",")}@${plan.paperclipVersion ?? "?"}`;
+    const prev = await ctx.state.get(UPSTREAM_KEY).catch(() => null);
+    if (prev?.signature === signature) return;
+    await ctx.state.set(UPSTREAM_KEY, { signature, at: new Date().toISOString(), paperclipVersion: plan.paperclipVersion ?? null, protections: plan.nowUpstream }).catch(() => {});
+    const names = plan.nowUpstream.map((u) => u.title).join(", ");
+    log.info(`now part of Paperclip, no longer needed: ${names}`);
+    await logActivity(null, settings, `Security hardening: now part of Paperclip, no longer needed (${names})`, { protections: plan.nowUpstream, paperclipVersion: plan.paperclipVersion ?? null });
+  }
+  const decisionSignature = (plan) => `${plan.unfitting.map((i) => i.id).sort().join(",")}@${plan.paperclipVersion ?? "?"}`;
+  /** Local_trusted: every caller without a token is the board (a boxed agent included): one HIGH alert while the instance runs that way. */
+  async function checkDeploymentMode(target, settings) {
+    if (target.deploymentMode !== "local_trusted") { await ctx.state.set(LOCAL_TRUSTED_KEY, null).catch(() => {}); return; }
+    const prev = await ctx.state.get(LOCAL_TRUSTED_KEY).catch(() => null);
+    if (prev?.alerted) return;
+    log.error(LOCAL_TRUSTED_TEXT);
+    const a = await raiseAlertIssue({ ctx, settings, priority: "high", metadata: { source: "local-trusted" },
+      title: "[Security hardening] Paperclip runs in local_trusted mode: agents can act as the board",
+      description: `${LOCAL_TRUSTED_TEXT}\n\nSwitch the instance to authenticated mode (deployment mode "authenticated" in its config file or PAPERCLIP_DEPLOYMENT_MODE) and restart Paperclip. The protections of this plugin that decide by "who is calling" (board-only changes, the Test probe) cannot hold against a caller that Paperclip already treats as the board.` });
+    if (a.ok) await ctx.state.set(LOCAL_TRUSTED_KEY, { alerted: true }).catch(() => {});
   }
   const clearDecision = () => ctx.state.set(UPDATE_DECISION_KEY, null).catch(() => {});
 
@@ -340,6 +383,7 @@ export function createHardening({ ctx, engineOptions = {}, resolveTargetFn = res
         if (withFiles[id] && res?.filesKey === filesKey(withFiles[id], status.files)) selfTests[id] = { ...res, at: st.at, trigger: st.trigger };
       }
       const decision = await ctx.state.get(UPDATE_DECISION_KEY).catch(() => null);
+      const upstream = await ctx.state.get(UPSTREAM_KEY).catch(() => null);
       const hosts = hostStatusFn ? await hostStatusFn().catch((e) => { log.warn(`host install status unavailable: ${e.message}`); return null; }) : null;
       const info = engine.restartInfo();
       const started = status.serverStartedAt;
@@ -352,8 +396,11 @@ export function createHardening({ ctx, engineOptions = {}, resolveTargetFn = res
         tree: status.tree,
         paperclipVersion: status.paperclipVersion,
         enabled: status.enabled,
-        protections: PROTECTIONS.map((p) => rowFor(p, byId[p.id], unavailable[p.id] ?? null, selfTests[p.id] ?? null, hosts, decision?.protections?.find((d) => d.id === p.id) ?? null)),
-        updateDecision: decision?.protections?.length ? { at: decision.at ?? null, paperclipVersion: decision.paperclipVersion ?? null, protections: decision.protections } : null,
+        protections: PROTECTIONS.map((p) => rowFor(p, byId[p.id], unavailable[p.id] ?? null, selfTests[p.id] ?? null, hosts, decision?.protections?.find((d) => d.id === p.id) ?? null, upstream?.protections?.find((d) => d.id === p.id) ?? null)),
+        nowUpstream: upstream?.protections?.length ? { at: upstream.at ?? null, paperclipVersion: upstream.paperclipVersion ?? null, protections: upstream.protections } : null,
+        deploymentMode: target.deploymentMode ?? null,
+        localTrusted: target.deploymentMode === "local_trusted" ? LOCAL_TRUSTED_TEXT : null,
+        updateDecision: decision?.protections?.length ? { at: decision.at ?? null, paperclipVersion: decision.paperclipVersion ?? null, held: Boolean(decision.held), protections: decision.protections } : null,
         selfTest: st ? { at: st.at ?? null, trigger: st.trigger ?? null, waitingRestart: Boolean(st.waitingRestart), failed: st.failed ?? [] } : null,
         watchdog: hosts?.watchdog ?? null,
         hermes: hosts?.hermes ?? null,
@@ -395,7 +442,10 @@ export function createHardening({ ctx, engineOptions = {}, resolveTargetFn = res
         availabilityCache = null;
         const summary = summarizePlan(plan, req.switchedOff);
         if (!result.ok) return { ok: false, error: result.error, plan: summary };
-        await clearDecision(); // the admin decided (a plan that drops a core protection needed the confirmation)
+        // Nothing left that does not fit: the alert is over. Dropping one that is in the files needed the confirmation: that is the decision,
+        // remembered for this set and Paperclip version so that the next start does not alert again.
+        if (!plan.unfitting.length) await clearDecision();
+        else if (params.confirmCoreOff === true && plan.confirmationNeeded.length) await ctx.state.set(UPDATE_DECISION_KEY, { at: new Date().toISOString(), paperclipVersion: plan.paperclipVersion ?? null, signature: decisionSignature(plan), alerted: true, held: false, accepted: true, protections: [] }).catch(() => {});
         const after = (await engine.status()).enabled;
         const changedSet = before.join(",") !== after.join(",");
         if (result.changed.length || changedSet) {
@@ -487,6 +537,7 @@ export function createHardening({ ctx, engineOptions = {}, resolveTargetFn = res
           return { ok: false, error: e.message, code: e.targetCode, config: null };
         }
         await ctx.state.set(TARGET_ALERT_KEY, { code: null }).catch(() => {});
+        await checkDeploymentMode(target, settings);
         // Only once an admin saved settings: never replace a settings file written by hand before the plugin was set up.
         const saved = await ctx.state.get(SETTINGS_KEY).catch(() => null);
         const cfg = saved === null ? null
@@ -496,16 +547,24 @@ export function createHardening({ ctx, engineOptions = {}, resolveTargetFn = res
         const enabled = (await engine.status()).enabled;
         if (!enabled.length) return { ok: true, applied: false, reason: "nothing switched on", config: cfg };
         const plan = await engine.replan();
-        if (plan.confirmationNeeded.length) return { ...(await holdForDecision(plan, settings)), config: cfg };
-        await clearDecision();
-        if (!plan.changes) return { ok: true, applied: false, reason: "files already match", config: cfg };
+        const unfitting = plan.unfitting.map((u) => u.id);
+        await noteUpstream(plan, settings);
+        if (!unfitting.length) await clearDecision();
+        else {
+          const { held } = await reportUnfitting(plan, settings);
+          if (held || plan.confirmationNeeded.length) {
+            return { ok: false, applied: false, needsDecision: true, protections: unfitting, config: cfg,
+              error: `${plan.unfitting.map((u) => u.title).join(", ")} no longer fit${unfitting.length === 1 ? "s" : ""} this Paperclip; nothing was rebuilt` };
+          }
+        }
+        if (!plan.changes) return { ok: true, applied: false, reason: "files already match", unfitting, config: cfg };
         const result = await engine.apply(plan);
         availabilityCache = null;
         if (!result.ok) { log.error(`re-applying the protections failed: ${result.error}`); return { ok: false, error: result.error, config: cfg }; }
         const refreshed = plan.files.filter((f) => f.pristineSource === "refreshed").map((f) => f.rel);
         await logActivity(null, settings, `Security hardening re-applied after start${refreshed.length ? " (Paperclip files changed, e.g. an update)" : ""}; restart Paperclip to activate`,
           { changedFiles: result.changed, refreshedOriginals: refreshed, unavailable: Object.keys(result.unavailable ?? {}) });
-        return { ok: true, applied: true, changed: result.changed, unavailable: result.unavailable, config: cfg };
+        return { ok: true, applied: true, changed: result.changed, unavailable: result.unavailable, unfitting, config: cfg };
       });
     },
   };
@@ -524,7 +583,7 @@ const HOST_ROWS = {
   "hermes-boxed": (h) => h?.hermes && { status: h.hermes.status, enabled: h.hermes.status !== "off", reason: `${h.hermes.path}: ${h.hermes.reason}` },
 };
 
-function rowFor(p, st, unavailableReason, selfTest = null, hosts = null, decision = null) {
+function rowFor(p, st, unavailableReason, selfTest = null, hosts = null, decision = null, upstream = null) {
   const host = HOST_ROWS[p.id]?.(hosts);
   if (host) {
     return { id: p.id, title: p.title, description: p.description, kind: p.kind, core: p.core, risk: p.risk ?? null, requires: p.requires,
@@ -542,10 +601,14 @@ function rowFor(p, st, unavailableReason, selfTest = null, hosts = null, decisio
   else status = st.status; // applied | pending-restart | unavailable | drifted
   let reason = placeholder ? PLACEHOLDER_NOTE : (st?.reason ?? unavailableReason ?? null);
   if (decision && !placeholder) {
-    // The automatic re-apply stopped because this core protection no longer fits (see holdForDecision): not "off", not "unavailable".
+    // This core protection no longer fits (see reportUnfitting): not "off", not "unavailable".
     status = "needs-decision";
-    reason = `A Paperclip update changed the code this protection patches (${decision.reason ?? "it does not fit"}). Nothing was rebuilt; Save asks you to confirm dropping it.`;
+    reason = decision.held
+      ? `A Paperclip update changed the code this protection patches (${decision.reason ?? "it does not fit"}). Nothing was rebuilt; Save asks you to confirm dropping it.`
+      : `A Paperclip update changed the code this protection patches (${decision.reason ?? "it does not fit"}). It is skipped and stays switched on; the protections that fit were applied. A plugin release that fits this Paperclip brings it back on the next start.`;
   }
+  if (upstream && !placeholder && !decision && ["applied", "pending-restart"].includes(status))
+    reason = `Now part of Paperclip (${upstream.patches.join(", ")}): no longer needed.`;
   if (status === "applied" && selfTest && !selfTest.ok) {
     status = "selftest-failed";
     reason = selfTest.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`).join("; ");

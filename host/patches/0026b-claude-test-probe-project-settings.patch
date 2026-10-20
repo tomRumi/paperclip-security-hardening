@@ -7,39 +7,48 @@
  import { asString, asBoolean, asNumber, asStringArray, parseObject, ensurePathInEnv, } from "@paperclipai/adapter-utils/server-utils";
  import { ensureAdapterExecutionTargetCommandResolvable, ensureAdapterExecutionTargetDirectory, runAdapterExecutionTargetProcess, resolveAdapterExecutionTargetCwd, resolveAdapterExecutionTargetCommandForLogs, } from "@paperclipai/adapter-utils/execution-target";
  import { detectClaudeLoginRequired, isClaudeProviderQuotaError, isClaudeTransientUpstreamError, parseClaudeStreamJson, } from "./parse.js";
-@@ -25,6 +28,20 @@
+@@ -25,6 +28,24 @@
          return false;
      return trustedCommand === runtimeCommand;
  }
 +// LOCAL-PATCH 0026b: the CLAUDE_CONFIG_DIR of a Test request is kept only when it is the credential home the server itself made for a managed
-+// AI connection of this company (<tmp>/paperclip-ai-<company>-<grant>-*/provider). Any other value is the caller's: for a boxed agent it is a
++// AI connection of this company (<tmp>/paperclip-ai-<company>-<grant>-*/provider), whose home directory is owned by the server's user with
++// mode 0700 (as mkdtemp makes it); the probe then gets its real path, never the request's string. Any other value is the caller's: for a boxed agent it is a
 +// folder inside its own box, which the agent writes, and Claude loads the hooks of the settings.json found there. The probe then falls back to
 +// the server's own environment (its own CLAUDE_CONFIG_DIR or home directory).
-+async function isManagedAiClaudeConfigDir0026b(dir, companyId) {
++async function managedAiClaudeConfigDir0026b(dir, companyId) {
 +    if (typeof dir !== "string" || dir.trim() === "" || !/^[A-Za-z0-9_-]{1,128}$/.test(String(companyId ?? "")))
-+        return false;
++        return "";
 +    const real = await fs.realpath(dir).catch(() => "");
 +    const tmp = await fs.realpath(os.tmpdir()).catch(() => os.tmpdir());
 +    if (!real || path.basename(real) !== "provider")
-+        return false;
++        return "";
 +    const home = path.dirname(real);
-+    return path.dirname(home) === tmp && path.basename(home).startsWith(`paperclip-ai-${companyId}-`);
++    if (path.dirname(home) !== tmp || !path.basename(home).startsWith(`paperclip-ai-${companyId}-`))
++        return "";
++    const st = await fs.stat(home).catch(() => null);
++    return st && st.isDirectory() && st.uid === process.getuid() && (st.mode & 0o777) === 0o700 ? real : "";
 +}
  export async function testEnvironment(ctx) {
      const engineSelection = await resolveClaudeExecutionEngineForRun({
          config: parseObject(ctx.config),
-@@ -90,6 +107,10 @@
+@@ -90,6 +111,15 @@
      const localProbe = targetIsRemote
          ? null
          : await buildLocalAdapterTestProbeEnv({ callerEnv: env, trustedEnv: process.env });
 +    // LOCAL-PATCH 0026b: the hello probe of a local target runs the trusted server `claude` as the service user, outside any agent box, and it
 +    // must not load anything an agent can write: only the user settings (see below), never the CLAUDE_CONFIG_DIR of the request.
-+    if (localProbe && "CLAUDE_CONFIG_DIR" in localProbe.env && !(config.managedAiConnection && await isManagedAiClaudeConfigDir0026b(localProbe.env.CLAUDE_CONFIG_DIR, ctx.companyId)))
-+        delete localProbe.env.CLAUDE_CONFIG_DIR;
++    if (localProbe && "CLAUDE_CONFIG_DIR" in localProbe.env) {
++        const managedDir0026b = config.managedAiConnection ? await managedAiClaudeConfigDir0026b(localProbe.env.CLAUDE_CONFIG_DIR, ctx.companyId) : "";
++        if (managedDir0026b)
++            localProbe.env.CLAUDE_CONFIG_DIR = managedDir0026b;
++        else
++            delete localProbe.env.CLAUDE_CONFIG_DIR;
++    }
      checks.push(...(await prepareSandboxClaudeProbeRuntime({
          managedAiConnection: Boolean(config.managedAiConnection),
          runId,
-@@ -283,8 +304,14 @@
+@@ -283,8 +313,14 @@
                      });
                  }
              }
@@ -55,7 +64,7 @@
                  args.push("--setting-sources", "user");
              args.push(...buildClaudeProbePermissionArgs({
                  dangerouslySkipPermissions,
-@@ -312,14 +339,15 @@
+@@ -312,14 +348,15 @@
              // env, because the remote transport owns its own env sanitization.
              const probeCommand = localProbe?.command ?? command;
              const probeEnv = localProbe ? localProbe.env : env;

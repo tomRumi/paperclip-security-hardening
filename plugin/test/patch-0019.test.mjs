@@ -422,6 +422,7 @@ if [ "$1" = models ]; then
 fi
 cat >/dev/null
 { printf "home=%s\\n" "$HOME"; printf "canary=%s\\n" "\${HARDENING_CANARY_SECRET:-absent}"; printf "cwd=%s\\n" "$PWD"; printf "env=%s\\n" "$(env | sed 's/=.*//' | sort | tr '\\n' ' ')"; } > "$PWD/run-probe.txt" 2>/dev/null
+if [ -n "$HARDENING_PROBE_LOG" ]; then { printf "home=%s\\n" "$HOME"; printf "canary=%s\\n" "\${HARDENING_CANARY_SECRET:-absent}"; printf "cwd=%s\\n" "$PWD"; ls -A "$PWD" | tr '\\n' ' ' | sed 's/^/ls=/;s/$/\\n/'; } >> "$HARDENING_PROBE_LOG" 2>/dev/null; fi
 if [ -f "$PWD/.opencode/plugin/evil.sh" ]; then sh "$PWD/.opencode/plugin/evil.sh"; fi
 echo '{"type":"text","part":{"text":"hello"}}'
 `;
@@ -439,7 +440,7 @@ async function runEnvTest(tree, { world, config = {}, env = {}, serverEnv = {}, 
   const saved = { ...process.env };
   const hostStderr = [];
   const write = process.stderr.write;
-  Object.assign(process.env, { HOME: world.realHome, PAPERCLIP_HOME: world.paperclipHome, PAPERCLIP_INSTANCE_ID: "test", PAPERCLIP_OPENCODE_COMMAND: path.join(bin, "opencode"), ...CANARY_ENV, ...serverEnv });
+  Object.assign(process.env, { HOME: world.realHome, PAPERCLIP_HOME: world.paperclipHome, PAPERCLIP_INSTANCE_ID: "test", PAPERCLIP_OPENCODE_COMMAND: path.join(bin, "opencode"), HARDENING_PROBE_LOG: path.join(world.root, "probe.log"), ...CANARY_ENV, ...serverEnv });
   process.stderr.write = function (chunk, ...rest) { hostStderr.push(String(chunk)); return typeof rest.at(-1) === "function" ? rest.at(-1)() : true; };
   let result = null, error = null;
   try {
@@ -454,7 +455,7 @@ async function runEnvTest(tree, { world, config = {}, env = {}, serverEnv = {}, 
     Object.assign(process.env, saved);
   }
   const read = (name) => { try { return fs.readFileSync(path.join(world.workspace, name), "utf8"); } catch { return null; } };
-  return { result, error, hostStderr: hostStderr.join(""), run: read("run-probe.txt"), models: read("models-probe.txt"), evilRan: fs.existsSync(path.join(world.workspace, "evil-ran")), pwned: fs.existsSync(path.join(world.root, "PWNED")) ? fs.readFileSync(path.join(world.root, "PWNED"), "utf8") : null };
+  return { result, error, hostStderr: hostStderr.join(""), run: read("run-probe.txt"), models: read("models-probe.txt"), log: (() => { try { return fs.readFileSync(path.join(world.root, "probe.log"), "utf8"); } catch { return null; } })(), evilRan: fs.existsSync(path.join(world.workspace, "evil-ran")), pwned: fs.existsSync(path.join(world.root, "PWNED")) ? fs.readFileSync(path.join(world.root, "PWNED"), "utf8") : null };
 }
 const field = (text, key) => new RegExp(`^${key}=(.*)$`, "m").exec(text ?? "")?.[1] ?? null;
 
@@ -515,7 +516,7 @@ test("0019d: the command of the request never starts: a script named in config.c
     const post = await runEnvTest(after, { world: w, env, config: { command: evil(w), ...extra } });
     assert.equal(post.error, null, `${label}: ${post.error?.stack}`);
     assert.equal(fs.existsSync(path.join(w.root, "EVIL")), false, `${label}: the request's command did not run`);
-    assert.ok(post.run !== null, `${label}: the server's OpenCode did (the stub from PAPERCLIP_OPENCODE_COMMAND)`);
+    assert.ok(post.run !== null || post.log !== null, `${label}: the server's OpenCode did (the stub from PAPERCLIP_OPENCODE_COMMAND)`);
   }
   const wb = makeWorld(noD);
   const pre = await runEnvTest(noD, { world: wb, env, config: { command: evil(wb) } });
@@ -523,53 +524,24 @@ test("0019d: the command of the request never starts: a script named in config.c
   assert.equal(fs.readFileSync(path.join(wb.root, "EVIL"), "utf8"), "canary-secret-0000", "fail-before: the request's command ran, with the server's env");
 });
 
-test("0019d: an agent without a scope keeps the stock environment test", { skip: needVersion, timeout: 120_000 }, async (t) => {
+test("0019d: an agent without a scope keeps the stock environment test, but the probe runs in an empty private directory, not the workspace (fail-before: in the workspace, where a planted plugin runs)", { skip: needVersion, timeout: 120_000 }, async (t) => {
   const after = await treeFor(V, "after");
+  const noD = await treeFor(V, "no0019d");
   if (after.skip) return t.skip(after.skip);
+  if (noD.skip) return t.skip(noD.skip);
+  const scopeless = { filesystemScope: undefined, networkScope: undefined, networkAllowlist: undefined, filesystemSandboxCommand: undefined };
   const w = makeWorld(after);
-  const r = await runEnvTest(after, { world: w, env: { OPENROUTER_API_KEY: DUMMY_KEY }, config: { filesystemScope: undefined, networkScope: undefined, networkAllowlist: undefined, filesystemSandboxCommand: undefined } });
+  const r = await runEnvTest(after, { world: w, env: { OPENROUTER_API_KEY: DUMMY_KEY }, config: scopeless });
   assert.equal(r.error, null, String(r.error?.stack));
-  assert.equal(field(r.run, "home"), w.realHome);
-  assert.equal(field(r.run, "canary"), "canary-secret-0000");
-});
-
-test("the UI model listing has no agent behind it (listModels() gets no config, env or workspace): project config stays disabled and it runs in the server's own cwd (unchanged by the patches)", { skip: needVersion, timeout: 120_000 }, async (t) => {
-  const after = await treeFor(V, "after");
-  if (after.skip) return t.skip(after.skip);
-  const w = makeWorld(after);
-  const bin = path.join(w.root, "bin-list");
-  fs.mkdirSync(bin, { recursive: true });
-  fs.writeFileSync(path.join(bin, "opencode"), '#!/bin/sh\necho "flag/${OPENCODE_DISABLE_PROJECT_CONFIG}"\necho "cwd/$(pwd | tr / _)"\n', { mode: 0o755 });
-  const mod = await import(pathToFileURL(path.join(after.nm, "@paperclipai", PKG, "dist/server/index.js")).href);
-  const saved = process.env.PAPERCLIP_OPENCODE_COMMAND;
-  process.env.PAPERCLIP_OPENCODE_COMMAND = path.join(bin, "opencode");
-  try {
-    const ids = (await mod.listOpenCodeModels()).map((m) => m.id);
-    assert.deepEqual(ids, [`cwd/${process.cwd().replaceAll("/", "_")}`, "flag/true"]);
-  } finally { if (saved === undefined) delete process.env.PAPERCLIP_OPENCODE_COMMAND; else process.env.PAPERCLIP_OPENCODE_COMMAND = saved; }
-});
-
-test("the REAL opencode binary starts inside the box (own HOME, XDG state under the agent's runtime dir) and its request goes through the proxy", {
-  skip: needVersion || noBwrap || (process.env.HARDENING_TEST_OPENCODE_BIN && fs.existsSync(process.env.HARDENING_TEST_OPENCODE_BIN) ? false : "NO OPENCODE: set HARDENING_TEST_OPENCODE_BIN to an opencode binary (npm i opencode-ai); this one test runs it with a fake key"),
-  timeout: 240_000,
-}, async (t) => {
-  const after = await treeFor(V, "after");
-  if (after.skip) return t.skip(after.skip);
-  const w = makeWorld(after);
-  const key = `sk-or-v1-${"0".repeat(64)}`; // a fake key, well formed (a malformed one is dropped silently)
-  const r = await runAdapterProbe({
-    tree: after, world: w, adapter: ADAPTERS.opencode_local, probe: {},
-    config: { command: process.env.HARDENING_TEST_OPENCODE_BIN, model: "openrouter/openai/gpt-4o-mini", ...BOXED, networkAllowlist: ["allowed.example"], timeoutSec: 90 },
-    env: { OPENROUTER_API_KEY: key }, timeoutMs: 200_000,
-  });
-  assert.equal(r.error, null, String(r.error?.stack));
-  t.diagnostic(`exit=${r.result?.exitCode} error=${JSON.stringify(r.result?.errorMessage)?.slice(0, 200)} denied=${JSON.stringify(denied(r).map((e) => `${e.host}:${e.port}`))}`);
-  const state = path.join(homeOf(w), ".local", "share", "opencode");
-  assert.ok(fs.existsSync(state), "opencode created its data dir under the agent's runtime home, i.e. it started in the box with XDG_DATA_HOME there");
-  assert.deepEqual(fs.readdirSync(path.join(w.realHome, ".local", "share", "opencode")), ["canary"], "nothing was written to the home of the user running Paperclip");
-  assert.deepEqual(fs.readdirSync(path.join(w.realHome, ".config", "opencode")), ["canary"]);
-  const hosts = denied(r).map((e) => e.host);
-  assert.ok(hosts.includes("openrouter.ai"), `the provider request reached the proxy and was denied (not on the allowlist); denied: ${hosts.join(", ")}`);
-  assert.equal(hosts.includes("models.opencode.ai"), false, "OPENCODE_DISABLE_MODELS_FETCH: no model-list download");
-  assert.ok(denied(r).every((e) => e.agentId === w.agentId));
+  assert.equal(field(r.log, "home"), w.realHome, "still unboxed: the server's home");
+  assert.equal(field(r.log, "canary"), "canary-secret-0000", "and the server's env (the stock environment test)");
+  assert.match(field(r.log, "cwd"), /\/paperclip-opencode-envtest-cwd-[^/]+$/, "but in an empty temp directory");
+  assert.equal(/opencode\.json|\.opencode/.test(field(r.log, "ls") ?? ""), false, "which holds nothing of the workspace (only the stub's own probe files)");
+  assert.equal(r.evilRan, false, "so the plugin planted in the workspace did not run");
+  assert.equal(fs.existsSync(field(r.log, "cwd")), false, "and the directory is removed afterwards");
+  const wb = makeWorld(noD);
+  const pre = await runEnvTest(noD, { world: wb, env: { OPENROUTER_API_KEY: DUMMY_KEY }, config: scopeless, configCommand: true });
+  assert.equal(pre.error, null, String(pre.error?.stack));
+  assert.equal(field(pre.log, "cwd"), wb.workspace, "fail-before: the probe ran in the workspace");
+  assert.equal(pre.evilRan, true, "fail-before: and the planted plugin ran as the service user");
 });

@@ -1,10 +1,10 @@
 // (1) The two box switches: "Box Claude agents" (the helper, the scrub, the Claude adapter) and "Box OpenCode agents" (on top of it).
 //     Only boxed agents run needs the first, not the second: with the OpenCode switch off, OpenCode agents are refused and Claude agents
 //     run (the admission rule admits a type only when its adapter registered itself as boxed in the built files).
-// (2) A core protection that stops fitting on an update must never be dropped silently. The automatic re-apply on start (hardening.js
-//     start()) used to rebuild the files without it (and without everything that needs it, only-boxed with the admission rule). Now such
-//     a plan needs the owner's confirmation like a switch-off, so start() rebuilds NOTHING, raises a HIGH alert once and the page shows
-//     "update needs admin decision".
+// (2) A core protection that is IN the files and stops fitting (new patch files against the tree the engine built) must never be dropped
+//     silently: such a plan needs the owner's confirmation like a switch-off, so start() rebuilds NOTHING, raises a HIGH alert once and the
+//     page shows "update needs admin decision". (After a Paperclip update that made the files stock, nothing is dropped: see
+//     update-fail-mode.test.mjs, where everything that still fits is applied.)
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -120,8 +120,8 @@ for (const vkey of ["1012", "1005"]) {
       const r = await h2.start();
       assert.equal(r.ok, false);
       assert.equal(r.needsDecision, true);
-      assert.deepEqual(r.protections.slice().sort(), ["box-claude", "box-opencode", "only-boxed"].filter((id) => r.protections.includes(id)).sort());
-      assert.ok(r.protections.includes("box-claude") && r.protections.includes("only-boxed"));
+      // "Only boxed agents run" does not need "Box Claude agents" any more (soft dependency): only the helper's switch is listed.
+      assert.deepEqual(r.protections, ["box-claude"]);
       // Nothing was rebuilt: every file is byte-identical, heartbeat.js still has the admission rule (before: it was rebuilt without 0005b and 0005f).
       for (const rel of base.targets) assert.ok(fs.readFileSync(path.join(f.tree, rel)).equals(built[rel]), `${rel} was rebuilt`);
       assert.ok(fs.readFileSync(path.join(f.tree, HB), "utf8").includes("LOCAL-PATCH 0005f") && fs.readFileSync(path.join(f.tree, HB), "utf8").includes("LOCAL-PATCH 0005b"));
@@ -132,7 +132,6 @@ for (const vkey of ["1012", "1005"]) {
       assert.equal(fk.issues[0].priority, "high");
       assert.match(fk.issues[0].title, /Box Claude agents/);
       assert.match(fk.issues[0].description, /0017/);
-      assert.match(fk.issues[0].description, /Only boxed agents run/);
       assert.match(fk.issues[0].description, /changed NOTHING/);
       assert.equal((await h2.start()).needsDecision, true);
       assert.equal(fk.issues.length, 1, "no second alert for the same situation");
@@ -141,11 +140,10 @@ for (const vkey of ["1012", "1005"]) {
       // The page: the rows say so, with the reason.
       const st = await h2.getStatus();
       const rows = byId(st.protections);
-      for (const id of ["box-claude", "only-boxed"]) {
-        assert.equal(rows[id].status, "needs-decision", id);
-        assert.equal(rows[id].enabled, true);
-        assert.match(rows[id].reason, /update/i);
-      }
+      assert.equal(rows["box-claude"].status, "needs-decision");
+      assert.equal(rows["box-claude"].enabled, true);
+      assert.match(rows["box-claude"].reason, /update/i);
+      assert.notEqual(rows["only-boxed"].status, "needs-decision");
       assert.deepEqual(st.updateDecision.protections.map((p) => p.id).sort(), r.protections.slice().sort());
       assert.notEqual(rows["no-permission-handing"].status, "needs-decision");
 
@@ -158,16 +156,18 @@ for (const vkey of ["1012", "1005"]) {
       for (const rel of base.targets) assert.ok(fs.readFileSync(path.join(f.tree, rel)).equals(built[rel]), `${rel} changed by a refused apply`);
       const confirmed = await h2.applyChange({ enabled: before, confirmCoreOff: true }, ADMIN);
       assert.equal(confirmed.ok, true, confirmed.error);
-      assert.equal(fs.readFileSync(path.join(f.tree, HB), "utf8").includes("LOCAL-PATCH 0005f"), false, "after the owner confirmed, the rule is gone");
-      assert.equal((await h2.getStatus()).updateDecision, null, "the decision is cleared");
-      assert.equal(fk.state.get(`${UPDATE_DECISION_KEY.scopeKind}::${UPDATE_DECISION_KEY.stateKey}`), null);
-      // and the next start does not ask again (the protection is recorded as not fitting)
+      const nowHb = fs.readFileSync(path.join(f.tree, HB), "utf8");
+      assert.ok(nowHb.includes("LOCAL-PATCH 0005f"), "after the owner confirmed, the admission rule is still there (it does not need the helper)");
+      assert.equal(fs.readFileSync(path.join(f.tree, SANDBOX), "utf8").includes("LOCAL-PATCH 0017"), false, "the helper is gone");
+      assert.equal((await h2.getStatus()).updateDecision, null, "the decision is closed");
+      // and the next start does not ask or alert again for the same set and Paperclip version
       const again = await h2.start();
       assert.notEqual(again.needsDecision, true);
+      assert.equal(fk.issues.length, 1, "no second alert after the owner accepted");
     } finally { f.cleanup(); }
   });
 
-  test(`${vkey}: a Paperclip update replaces the files and a core patch no longer fits: start() changes nothing and alerts (before: it rebuilt heartbeat.js without the admission rule)`, { skip }, async () => {
+  test(`${vkey}: a Paperclip update replaces the files and the Box Claude patch no longer fits: start() applies everything else and alerts (before: it rebuilt nothing, the server ran stock files)`, { skip }, async () => {
     const f = base.fresh();
     try {
       const fk = fakeCtx();
@@ -184,13 +184,20 @@ for (const vkey of ["1012", "1005"]) {
       for (const rel of base.targets) fs.writeFileSync(path.join(f.tree, rel), updated[rel]);
 
       const r = await h.start();
-      assert.equal(r.needsDecision, true, r.error);
-      for (const rel of base.targets) assert.ok(fs.readFileSync(path.join(f.tree, rel)).equals(updated[rel]), `${rel}: start() rebuilt a file`);
+      // Everything that still fits is applied; only the helper switch is skipped (still on), with one HIGH alert.
+      assert.equal(r.ok, true, r.error);
+      assert.equal(r.applied, true);
+      assert.deepEqual(r.unfitting, ["box-claude"]);
       assert.equal(fk.issues.length, 1);
       assert.equal(fk.issues[0].priority, "high");
+      const hb = fs.readFileSync(path.join(f.tree, HB), "utf8");
+      for (const m of ["0005b", "0005f"]) assert.ok(hb.includes(`LOCAL-PATCH ${m}`), `${m} applied although "Box Claude agents" does not fit`);
+      assert.equal(fs.readFileSync(path.join(f.tree, SANDBOX), "utf8").includes("LOCAL-PATCH 0017"), false);
       const rows = byId((await h.getStatus()).protections);
       assert.equal(rows["box-claude"].status, "needs-decision");
-      assert.equal(rows["only-boxed"].status, "needs-decision");
+      assert.equal(rows["box-claude"].enabled, true);
+      assert.notEqual(rows["only-boxed"].status, "needs-decision");
+      assert.ok(["applied", "pending-restart"].includes(rows["only-boxed"].status), rows["only-boxed"].status);
       // Fixing the patch set (a plugin release for this Paperclip) and starting again applies everything and clears the decision.
       const fixedDir = path.join(f.dir, "fixed");
       fs.cpSync(base.root + "/base/patches", fixedDir, { recursive: true });
@@ -201,7 +208,7 @@ for (const vkey of ["1012", "1005"]) {
       assert.equal(ok.ok, true, ok.error);
       assert.equal(ok.applied, true);
       assert.equal((await h2.getStatus()).updateDecision, null);
-      assert.ok(fs.readFileSync(path.join(f.tree, HB), "utf8").includes("LOCAL-PATCH 0005f"));
+      assert.ok(fs.readFileSync(path.join(f.tree, SANDBOX), "utf8").includes("LOCAL-PATCH 0017"));
     } finally { f.cleanup(); }
   });
 

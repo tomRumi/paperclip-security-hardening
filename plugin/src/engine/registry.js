@@ -6,7 +6,10 @@
 //   "plugin-job"   runs inside the plugin (no Paperclip files change)
 //   "host-install" installed outside Paperclip by the admin's one-line install (no Paperclip files change)
 // core: switching it off must be confirmed by the owner; `risk` is the sentence the confirmation shows.
-// requires: protections that are switched on automatically together with this one.
+// requires: protections that are switched on automatically together with this one AND without which this one cannot work
+//           (a broken combination): if one of them does not fit this Paperclip, this one is unavailable too.
+// softRequires: protections that are switched on together with this one by default, but this one still applies when they
+//           do not fit this Paperclip (and switching one of them off does not switch this one off).
 
 export const PROTECTIONS = [
   {
@@ -43,8 +46,7 @@ export const PROTECTIONS = [
     risk: "Claude agents could run with the server's environment, including its database and API secrets, or fail to start inside the sandbox.",
     // The shared box helper builds on the public-web patch and the Claude adapter on the own-Claude-folder patch (their code is
     // changed further). The environment scrub must not be on without the Claude adapter (a boxed Claude agent would lose its
-    // credentials), and the admission rule of "only-boxed" must not be on without all of them (it would refuse every Claude
-    // agent): that is why they are one switch, and why "only-boxed" requires it.
+    // credentials): that is why they are one switch. "only-boxed" switches it on by default (softRequires) but does not need it.
     patches: ["0017", "0025", "0026", "0026b", "0026c"],
     requires: ["sandbox-compat", "public-web", "own-claude-folder"],
     defaultOn: true,
@@ -74,7 +76,10 @@ export const PROTECTIONS = [
     patches: ["0005b", "0005f", "0027"],
     // The admission rule reads the stored box that "own-box" keeps intact, and refuses a boxed agent whose adapter is not
     // set up by "box-claude" (or "box-opencode" for OpenCode: a type is admitted only when its adapter registered itself as boxed).
-    requires: ["sandbox-compat", "own-box", "box-claude"],
+    // "box-claude" is a soft dependency: when it does not fit a new Paperclip the rule still applies and refuses Claude agents
+    // (they are not registered as boxed), which fails closed; an agent without any sandbox is never admitted either way.
+    requires: ["sandbox-compat", "own-box"],
+    softRequires: ["box-claude"],
     defaultOn: true,
   },
   {

@@ -15,7 +15,7 @@ export const DATA_LEAF = "sandbox-hardening";
 const INSTANCE_ID_RE = /^[a-zA-Z0-9_-]+$/; // Paperclip's PATH_SEGMENT_RE
 const TREE_SCRIPT_RE = /^(.+)\/node_modules\/paperclipai\/dist\/index\.js$/;
 /** The only variables read from the server's start-up environment; every other value is dropped unread. */
-const ENV_KEYS = ["HOME", "PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "PAPERCLIP_CONFIG", "PAPERCLIP_HARDENING_CONFIG", "PAPERCLIP_SANDBOX_WORKSPACE_ROOT", "PAPERCLIP_DISABLE_CWD_ENV_FILE", "RUN_LOG_BASE_PATH"];
+const ENV_KEYS = ["HOME", "PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "PAPERCLIP_CONFIG", "PAPERCLIP_HARDENING_CONFIG", "PAPERCLIP_SANDBOX_WORKSPACE_ROOT", "PAPERCLIP_DISABLE_CWD_ENV_FILE", "RUN_LOG_BASE_PATH", "PAPERCLIP_DEPLOYMENT_MODE"];
 /** `node` options that take a value in the next argument (everything else starting with `-` stands alone). */
 const NODE_VALUE_OPTIONS = new Set(["-r", "--require", "--import", "--loader", "--experimental-loader", "-C", "--conditions", "--input-type", "--title"]);
 /** `node` options that load a file into the server's environment (`--env-file X`, `--env-file=X`, `--env-file-if-exists ...`); /proc/<pid>/environ never shows what they set. */
@@ -23,7 +23,7 @@ const NODE_ENV_FILE_OPTION_RE = /^--env-file(-if-exists)?(=|$)/;
 /** Variables of which only the fact that they are set is kept (never the value): dotenv switches to an encrypted `.env.vault` while DOTENV_KEY is non-empty. */
 const PRESENCE_KEYS = ["DOTENV_KEY"];
 /** The only variables read from a `.env` file that Paperclip loads (the file is parsed for these and nothing else). */
-const DOTENV_KEYS = ["PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "PAPERCLIP_CONFIG", "PAPERCLIP_HARDENING_CONFIG", "PAPERCLIP_SANDBOX_WORKSPACE_ROOT", "PAPERCLIP_DISABLE_CWD_ENV_FILE", "RUN_LOG_BASE_PATH"];
+const DOTENV_KEYS = ["PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "PAPERCLIP_CONFIG", "PAPERCLIP_HARDENING_CONFIG", "PAPERCLIP_SANDBOX_WORKSPACE_ROOT", "PAPERCLIP_DISABLE_CWD_ENV_FILE", "RUN_LOG_BASE_PATH", "PAPERCLIP_DEPLOYMENT_MODE"];
 /** Of those, the ones that decide which instance a server is: a value that only a `.env` file gives is not followed. */
 const INSTANCE_KEYS = ["PAPERCLIP_HOME", "PAPERCLIP_INSTANCE_ID", "PAPERCLIP_CONFIG"];
 const RUN_FLAGS = { "-i": "instance", "--instance": "instance", "-d": "dataDir", "--data-dir": "dataDir", "-c": "config", "--config": "config" };
@@ -297,7 +297,20 @@ function resolveRunStartup({ flags, env: startEnv, userHome, cwd, fsx, evidence 
     const [key, file] = dotenvLayout;
     throw new TargetError("CONFIG_LAYOUT", `${key} is set only in ${file}, which Paperclip loads; the instance cannot be told from a start-up environment that does not hold it (the value is not shown); ${FIX}`, [...evidence, `${key} in ${file}`]);
   }
-  return { layout, serverConfig, hardeningConfig: env.PAPERCLIP_HARDENING_CONFIG, sandboxRootsEnv: env.PAPERCLIP_SANDBOX_WORKSPACE_ROOT, runLogBasePath: env.RUN_LOG_BASE_PATH };
+  return { layout, serverConfig, hardeningConfig: env.PAPERCLIP_HARDENING_CONFIG, sandboxRootsEnv: env.PAPERCLIP_SANDBOX_WORKSPACE_ROOT, runLogBasePath: env.RUN_LOG_BASE_PATH, deploymentModeEnv: env.PAPERCLIP_DEPLOYMENT_MODE };
+}
+
+/** The server's resolveDeploymentMode: PAPERCLIP_DEPLOYMENT_MODE when valid, else `server.deploymentMode` of its config file, else
+ *  "local_trusted" (also without a config file). null when the config file cannot be read or says something else (not guessed). */
+function deploymentModeOf(fromEnv, serverConfigPath, fsx) {
+  const MODES = ["local_trusted", "authenticated"];
+  if (MODES.includes(fromEnv)) return fromEnv;
+  let text;
+  try { text = fsx.readFileSync(serverConfigPath, "utf8"); } catch (e) { return e?.code === "ENOENT" ? "local_trusted" : null; }
+  try {
+    const mode = JSON.parse(text)?.server?.deploymentMode;
+    return mode === undefined || mode === null ? "local_trusted" : MODES.includes(mode) ? mode : null;
+  } catch { return null; }
 }
 
 function derive({ pid, procRoot, uid, userHome: passwdHome, fsx }) {
@@ -339,7 +352,7 @@ function derive({ pid, procRoot, uid, userHome: passwdHome, fsx }) {
   const env = parseEnviron(read("environ"));
   const userHome = trimmed(env.HOME) || passwdHome || os.userInfo().homedir; // the home the server itself sees
   if (!path.isAbsolute(userHome ?? "")) throw new TargetError("BAD_INSTANCE", "the Paperclip server has no usable home directory", evidence);
-  const { layout, serverConfig, hardeningConfig, sandboxRootsEnv, runLogBasePath } = resolveRunStartup({ flags, env, userHome, cwd, fsx, evidence });
+  const { layout, serverConfig, hardeningConfig, sandboxRootsEnv, runLogBasePath, deploymentModeEnv } = resolveRunStartup({ flags, env, userHome, cwd, fsx, evidence });
   const { instanceId } = layout;
   if (serverConfig !== layout.serverConfigPath)
     throw new TargetError("CONFIG_LAYOUT", `the server reads its config (chosen by -c, PAPERCLIP_CONFIG or a .paperclip/config.json above its working directory) from outside its instance folder ${layout.serverConfigPath}; ${FIX}`, evidence);
@@ -363,7 +376,7 @@ function derive({ pid, procRoot, uid, userHome: passwdHome, fsx }) {
   return {
     source: "server-process", pid, startedAt, tree, script: realScript, userHome,
     home: layout.home, instanceId, instanceRoot: layout.instanceRoot, serverConfigPath: layout.serverConfigPath,
-    dataDir: layout.dataDir, configPath, sandboxRootsEnv: sandboxRootsEnv ?? "",
+    dataDir: layout.dataDir, configPath, deploymentMode: deploymentModeOf(deploymentModeEnv, layout.serverConfigPath, fsx), sandboxRootsEnv: sandboxRootsEnv ?? "",
     runLogBase: runLogBasePath === undefined ? layout.runLogBase : path.resolve(cwd, runLogBasePath), // `??` and path.resolve in the server's run-log store
     restart, fingerprint: { pid, startTicks, cmdlineSha: sha(cmdBuf) },
   };
@@ -402,6 +415,7 @@ export function summarizeTarget(target) {
   return {
     source: target.source, pid: target.pid ?? null, tree: target.tree, instanceId: target.instanceId ?? null, home: target.home ?? null,
     instanceRoot: target.instanceRoot ?? null, dataDir: target.dataDir, configPath: target.configPath,
+    deploymentMode: target.deploymentMode ?? null,
     restartUnit: target.restart?.unit ?? null, restartNote: target.restart?.unit ? null : (target.restart?.reason ?? null),
   };
 }

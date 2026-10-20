@@ -47,6 +47,12 @@ function plantConfigDir(dir, marker) {
   fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: `touch ${JSON.stringify(marker)}` }] }] } }));
   return dir;
 }
+/** Like plantConfigDir, but the hook writes the CLAUDE_CONFIG_DIR the probe was started with into `file`. */
+function plantEnvRecorder(dir, file) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: `printf %s "$CLAUDE_CONFIG_DIR" > ${JSON.stringify(file)}` }] }] } }));
+  return dir;
+}
 const probeDirs = () => fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith("paperclip-claude-probe-")).length;
 const BOXED = { filesystemScope: "workspace", networkScope: "allowlist", networkAllowlist: ["api.anthropic.com"], engine: "cli", helloProbeTimeoutSec: 25, env: { CLAUDE_CODE_OAUTH_TOKEN: "fake-token-for-tests" } };
 
@@ -118,6 +124,35 @@ for (const version of versions) {
     // ...but only for a managed request, and only the one of this company.
     assert.equal((await run(post, managedHome())).marker, false, "a lookalike folder without a managed connection is dropped");
     assert.equal((await run(post, managedHome("00000000-0000-4000-8000-0000000000ff"), { managedAiConnection: { identity: "i" } })).marker, false, "another company's managed home is dropped");
+    // The home the server makes is private (mkdtemp: mode 0700, owned by the server's user). A lookalike others can enter is dropped, and
+    // so is one owned by another user (not testable here without root: the check is `st.uid === process.getuid()`).
+    const modeHome = (mode) => (world, marker) => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), `paperclip-ai-${world.companyId}-grant1-`));
+      fs.chmodSync(home, mode);
+      t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+      return plantConfigDir(path.join(home, "provider"), marker);
+    };
+    assert.equal((await run(post, modeHome(0o700), { managedAiConnection: { identity: "i" } })).marker, true, "mode 0700 is the server's own");
+    assert.equal((await run(post, modeHome(0o755), { managedAiConnection: { identity: "i" } })).marker, false, "a home others can enter is dropped");
+    assert.equal((await run(post, modeHome(0o770), { managedAiConnection: { identity: "i" } })).marker, false, "so is a group-writable one");
+    // The probe gets the REAL path, not the string of the request (a link in the request could point elsewhere by the time claude reads it).
+    const viaLink = (tree) => {
+      const world = makeWorld(tree);
+      const recorded = path.join(world.root, "recorded-dir");
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), `paperclip-ai-${world.companyId}-grant1-`));
+      t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+      plantEnvRecorder(path.join(home, "provider"), recorded);
+      const link = path.join(world.workspace, "provider-link");
+      fs.symlinkSync(path.join(home, "provider"), link);
+      return { world, recorded, link, real: fs.realpathSync(path.join(home, "provider")) };
+    };
+    for (const [tree, label] of [[pre, "fail-before (0026 only)"], [post, "with 0026b"]]) {
+      const c = viaLink(tree);
+      const mod = await importFromTree(tree, "adapter-claude-local/dist/server/index.js");
+      await withProbeEnv(c.world, () => mod.testEnvironment({ companyId: c.world.companyId, adapterType: "claude_local", config: { ...BOXED, cwd: c.world.workspace, managedAiConnection: { identity: "i" }, env: { ...BOXED.env, CLAUDE_CONFIG_DIR: c.link } } }));
+      if (tree === pre) assert.equal(fs.existsSync(c.recorded) ? fs.readFileSync(c.recorded, "utf8") : null, c.link, `${label}: the request's own string is used`);
+      else assert.equal(fs.existsSync(c.recorded) ? fs.readFileSync(c.recorded, "utf8") : null, c.real, `${label}: the real path is used`);
+    }
   });
 
   test(V("0026c: the ACP login probe of a boxed agent does not run hooks planted in its workspace (fail-before: it does)"), opts, async (t) => {
@@ -161,6 +196,19 @@ for (const version of versions) {
     assert.equal(await configDirOnly(pre, false), true, "fail-before: the requested config dir's hooks ran");
     assert.equal(await configDirOnly(post, false), false, "the requested config dir is dropped");
     assert.equal(await configDirOnly(post, true), true, "the managed AI connection's home is kept");
+    // a lookalike home that others can enter is dropped
+    const looseHome = async (tree) => {
+      const world = makeWorld(tree);
+      const marker = path.join(world.root, "marker");
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), `paperclip-ai-${world.companyId}-grant1-`));
+      fs.chmodSync(home, 0o755);
+      t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+      const dir = plantConfigDir(path.join(home, "provider"), marker);
+      const mod = await importFromTree(tree, "adapter-claude-local/dist/server/acp.js");
+      await withProbeEnv(world, () => mod.probeClaudeAcpSandboxLogin({ config: { ...BOXED, cwd: world.workspace, managedAiConnection: { identity: "i" } }, env: { ...BOXED.env, CLAUDE_CONFIG_DIR: dir }, target: null, companyId: world.companyId }));
+      return fs.existsSync(marker);
+    };
+    assert.equal(await looseHome(post), false, "a managed-looking home with mode 0755 is dropped");
   });
 }
 

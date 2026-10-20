@@ -32,7 +32,7 @@ function ownPatches(f) {
   return f;
 }
 
-/** The protections the engine switches on for `ids` (pure data: the closure over `requires`). */
+/** The protections the engine switches on for `ids` (pure data: the closure over the hard `requires`; `softRequires` are switched on together by the engine but are not needed). */
 function closure(ids) {
   const out = new Set();
   const visit = (id) => { if (out.has(id)) return; out.add(id); getProtection(id).requires.forEach(visit); };
@@ -68,7 +68,8 @@ test("a broken combination of patches cannot be switched on: dependencies hold f
   assert.deepEqual(getProtection("box-opencode").requires, ["box-claude"], "OpenCode uses the helper and the scrub of the Claude switch");
   const onlyBoxed = getProtection("only-boxed");
   assert.ok(onlyBoxed.requires.includes("own-box"));
-  assert.ok(onlyBoxed.requires.includes("box-claude"));
+  assert.ok(!onlyBoxed.requires.includes("box-claude"), "box-claude is a soft dependency of the admission rule: without it Claude agents are refused (fail closed)");
+  assert.deepEqual(onlyBoxed.softRequires, ["box-claude"]);
   assert.ok(!onlyBoxed.requires.includes("box-opencode"), "the admission rule never needs the OpenCode switch: it refuses an OpenCode agent whose adapter is not boxed");
 
   const ids = PATCH_PROTECTIONS;
@@ -76,7 +77,7 @@ test("a broken combination of patches cannot be switched on: dependencies hold f
   const needs = {
     "box-claude": ["sandbox-compat", "public-web", "own-claude-folder"],
     "box-opencode": ["sandbox-compat", "box-claude", "public-web", "own-claude-folder"],
-    "only-boxed": ["sandbox-compat", "own-box", "box-claude", "public-web", "own-claude-folder"],
+    "only-boxed": ["sandbox-compat", "own-box"],
   };
   for (let mask = 0; mask < 1 << ids.length; mask++) {
     const picked = ids.filter((_, i) => mask & (1 << i));
@@ -84,7 +85,8 @@ test("a broken combination of patches cannot be switched on: dependencies hold f
     const patchesOn = new Set([...on].flatMap((id) => getProtection(id).patches));
     // 0025 only with 0026 and 0017; 0005f only with 0017, 0025, 0026 and with 0003b (own-box); 0005f replaces 0005b's body.
     // OpenCode (0019*) only with the helper and the scrub; without it 0005f refuses OpenCode agents, which is the safe way to lack it.
-    const requires = { "0025": ["0026", "0017"], "0026": ["0016", "0025", "0017"], "0017": ["0015", "0025"], "0005f": ["0005b", "0017", "0025", "0026", "0003", "0003b"], "0003b": ["0003"], "0019": ["0017", "0025"], "0019d": ["0019"] };
+    // (0005f needs neither the helper nor the scrub nor the Claude adapter: soft dependency, it refuses Claude agents without them.)
+    const requires = { "0025": ["0026", "0017"], "0026": ["0016", "0025", "0017"], "0017": ["0015", "0025"], "0005f": ["0005b", "0003", "0003b"], "0003b": ["0003"], "0019": ["0017", "0025"], "0019d": ["0019"] };
     for (const [patch, others] of Object.entries(requires))
       if (patchesOn.has(patch)) for (const o of others) assert.ok(patchesOn.has(o), `{${picked.join(", ")}}: ${patch} is on without ${o}`);
     for (const [id, list] of Object.entries(needs)) if (on.has(id)) for (const n of list) assert.ok(on.has(n), `{${picked.join(", ")}}: ${id} without ${n}`);
@@ -172,11 +174,12 @@ for (const vkey of ["1012", "1005"]) {
       assert.equal(prot["box-claude"].action, "unavailable");
       assert.match(prot["box-claude"].reason, /patch 0025 has no patch file/);
       assert.equal(prot["box-opencode"].action, "unavailable", "OpenCode needs the Claude switch's helper and scrub");
-      assert.equal(prot["only-boxed"].action, "unavailable");
+      assert.equal(prot["only-boxed"].action, "will-apply", "soft dependency: the admission rule applies without the Claude box");
       assert.equal(prot["sandbox-compat"].action, "will-apply");
       assert.equal((await engine.apply(plan)).ok, true);
-      for (const [id, rel] of [["0017", "adapter-utils/dist/local-process-sandbox.js"], ["0026", "adapter-claude-local/dist/server/execute.js"], ["0005f", "server/dist/services/heartbeat.js"], ["0019", "adapter-opencode-local/dist/server/execute.js"]])
+      for (const [id, rel] of [["0017", "adapter-utils/dist/local-process-sandbox.js"], ["0026", "adapter-claude-local/dist/server/execute.js"], ["0019", "adapter-opencode-local/dist/server/execute.js"]])
         assert.ok(!fs.readFileSync(path.join(g.tree, "node_modules/@paperclipai", rel), "utf8").includes(`LOCAL-PATCH ${id}`), `${id} applied without the rest of its switch`);
+      assert.ok(fs.readFileSync(path.join(g.tree, "node_modules/@paperclipai/server/dist/services/heartbeat.js"), "utf8").includes("LOCAL-PATCH 0005f"), "the admission rule is in");
     } finally { g.cleanup(); }
   });
 }

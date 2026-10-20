@@ -42,15 +42,15 @@ user and not group- or world-writable. Without the file they use secure generic 
 | 0019 | adapter-opencode-local `execute` | `opencode_local` runs in the box: own home and state folders per agent, skills copied in |
 | 0019b | adapter-opencode-local `models` | `opencode models` (model discovery) runs in the box |
 | 0019c | adapter-opencode-local `runtime-config` | A boxed run takes `{env:NAME}` values and its config only from the agent's own env, never the server's |
-| 0019d | adapter-opencode-local `test` | The "Test environment" probes run in the box, and a local probe starts the server's own OpenCode, never the command of the request |
+| 0019d | adapter-opencode-local `test` | The "Test environment" probes run in the box, and a local probe starts the server's own OpenCode, never the command of the request; a probe without scopes runs in an empty temp folder |
 | 0025 | adapter-utils `server-utils` | A boxed child gets a fixed list of variables plus the names its adapter lists, not the server's environment |
 | 0026 | adapter-claude-local `execute` | `claude_local` runs through the shared box helper and the environment scrub |
-| 0026b | adapter-claude-local `test` | The "Test environment" probe of a local target always loads user settings only, runs in an empty folder (no project hooks) and ignores a `CLAUDE_CONFIG_DIR` that is not the managed AI connection's home |
+| 0026b | adapter-claude-local `test` | The "Test environment" probe of a local target always loads user settings only, runs in an empty folder (no project hooks) and ignores a `CLAUDE_CONFIG_DIR` that is not the managed AI connection's home (owned by the server's user, mode 0700; the probe gets the real path) |
 | 0026c | adapter-claude-local `acp` | The same for the ACP probe |
 | 0027 | server `routes/agents` | `POST /companies/:id/adapters/:type/test-environment` is for board users only (an agent with the create-agents right was enough before) |
 
 In the plugin, the switches map to the patches as: Sandbox compatibility 0001, 0004, 0006a/b, 0012, 0014; own box 0002, 0003, 0003b, 0008; box Claude agents 0017, 0025, 0026, 0026b, 0026c;
-box OpenCode agents 0019, 0019b, 0019c, 0019d (needs box Claude agents); only boxed agents 0005b, 0005f, 0027;
+box OpenCode agents 0019, 0019b, 0019c, 0019d (needs box Claude agents); only boxed agents 0005b, 0005f, 0027 (box Claude agents is a soft dependency: switched on together, not needed);
 safe defaults 0005a, 0005c, 0005d, 0005e, 0010; no permission handing 0009, 0011a/b; pipeline 0007; assign grant 0013a/b; public-web box 0015; own Claude folder 0016.
 Separate PRs are suggested per numbered section below (0014-0016 are described at the end).
 

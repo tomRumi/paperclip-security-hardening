@@ -308,7 +308,15 @@ export function HardeningPage({ context }) {
     message ? h(StatusBadge, { label: message.text, status: message.tone }) : null,
     s.updateDecision ? h("div", { style: { ...box, borderColor: "rgba(220,60,60,0.6)", display: "grid", gap: 4 } },
       h("strong", null, "A Paperclip update needs your decision."),
-      h("span", null, `${s.updateDecision.protections.map((d) => d.title).join(", ")} no longer fit${s.updateDecision.protections.length === 1 ? "s" : ""} this Paperclip${s.updateDecision.paperclipVersion ? ` (${s.updateDecision.paperclipVersion})` : ""}. The plugin rebuilt nothing, so the files are as they were. Install a plugin release that fits this Paperclip, or Save to rebuild without them after confirming.`)) : null,
+      h("span", null, `${s.updateDecision.protections.map((d) => d.title).join(", ")} no longer fit${s.updateDecision.protections.length === 1 ? "s" : ""} this Paperclip${s.updateDecision.paperclipVersion ? ` (${s.updateDecision.paperclipVersion})` : ""}. ${s.updateDecision.held
+        ? "The plugin rebuilt nothing, so the files are as they were. Install a plugin release that fits this Paperclip, or Save to rebuild without them after confirming."
+        : "They are skipped (still switched on) and every protection that fits was applied. Install a plugin release that fits this Paperclip."}`)) : null,
+    s.nowUpstream ? h("div", { style: { ...box, display: "grid", gap: 4 } },
+      h("strong", null, "Now part of Paperclip."),
+      h("span", null, `${s.nowUpstream.protections.map((d) => d.title).join(", ")}: Paperclip ${s.nowUpstream.paperclipVersion ?? ""} contains the change itself, so the plugin's patch is no longer needed. The protection counts as satisfied.`)) : null,
+    s.localTrusted ? h("div", { style: { ...box, borderColor: "rgba(220,60,60,0.6)", display: "grid", gap: 4 } },
+      h("strong", null, "This Paperclip runs in local_trusted mode."),
+      h("span", null, s.localTrusted)) : null,
     r?.needed ? h("div", { style: { ...box, display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center" } },
       h(StatusBadge, { label: r.settingsChanged ? "Restart needed (settings changed)" : "Restart needed", status: "pending" }),
       r.canRestart ? h("button", { type: "button", disabled: busy, onClick: onRestart }, "Restart Paperclip")

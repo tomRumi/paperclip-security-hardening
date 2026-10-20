@@ -85,8 +85,8 @@ test("after a restart every applied protection passes; six are functional, the r
     assert.equal(st.selfTest.waitingRestart, false);
 
     // A later change of the protection's files invalidates the stored result (status no longer claims a pass). Switching the
-    // public-web box off also switches off what is built on it (the box for Claude and OpenCode agents, and the admission rule).
-    assert.equal((await h.applyChange({ enabled: DEFAULTS.filter((id) => id !== "public-web"), confirmCoreOff: true }, ADMIN)).ok, true);
+    // public-web box off also switches off what is built on it (the box for Claude and OpenCode agents); the admission rule is switched off here too (it would keep the Claude box, and so public-web, on).
+    assert.equal((await h.applyChange({ enabled: DEFAULTS.filter((id) => id !== "public-web" && id !== "only-boxed"), confirmCoreOff: true }, ADMIN)).ok, true);
     started = new Date(Date.now() + 120000).toISOString();
     const rows2 = byId((await h.getStatus()).protections);
     assert.equal(rows2["sandbox-compat"].selfTest, null, "local-process-sandbox.js was rebuilt");
