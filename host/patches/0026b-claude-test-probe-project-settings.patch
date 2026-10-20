@@ -1,0 +1,75 @@
+--- a/node_modules/@paperclipai/adapter-claude-local/dist/server/test.js
++++ b/node_modules/@paperclipai/adapter-claude-local/dist/server/test.js
+@@ -1,3 +1,6 @@
++import fs from "node:fs/promises"; // LOCAL-PATCH 0026b
++import os from "node:os"; // LOCAL-PATCH 0026b
++import path from "node:path"; // LOCAL-PATCH 0026b
+ import { asString, asBoolean, asNumber, asStringArray, parseObject, ensurePathInEnv, } from "@paperclipai/adapter-utils/server-utils";
+ import { ensureAdapterExecutionTargetCommandResolvable, ensureAdapterExecutionTargetDirectory, runAdapterExecutionTargetProcess, resolveAdapterExecutionTargetCwd, resolveAdapterExecutionTargetCommandForLogs, } from "@paperclipai/adapter-utils/execution-target";
+ import { detectClaudeLoginRequired, isClaudeProviderQuotaError, isClaudeTransientUpstreamError, parseClaudeStreamJson, } from "./parse.js";
+@@ -25,6 +28,20 @@
+         return false;
+     return trustedCommand === runtimeCommand;
+ }
++// LOCAL-PATCH 0026b: the CLAUDE_CONFIG_DIR of a Test request is kept only when it is the credential home the server itself made for a managed
++// AI connection of this company (<tmp>/paperclip-ai-<company>-<grant>-*/provider). Any other value is the caller's: for a boxed agent it is a
++// folder inside its own box, which the agent writes, and Claude loads the hooks of the settings.json found there. The probe then falls back to
++// the server's own environment (its own CLAUDE_CONFIG_DIR or home directory).
++async function isManagedAiClaudeConfigDir0026b(dir, companyId) {
++    if (typeof dir !== "string" || dir.trim() === "" || !/^[A-Za-z0-9_-]{1,128}$/.test(String(companyId ?? "")))
++        return false;
++    const real = await fs.realpath(dir).catch(() => "");
++    const tmp = await fs.realpath(os.tmpdir()).catch(() => os.tmpdir());
++    if (!real || path.basename(real) !== "provider")
++        return false;
++    const home = path.dirname(real);
++    return path.dirname(home) === tmp && path.basename(home).startsWith(`paperclip-ai-${companyId}-`);
++}
+ export async function testEnvironment(ctx) {
+     const engineSelection = await resolveClaudeExecutionEngineForRun({
+         config: parseObject(ctx.config),
+@@ -90,6 +107,10 @@
+     const localProbe = targetIsRemote
+         ? null
+         : await buildLocalAdapterTestProbeEnv({ callerEnv: env, trustedEnv: process.env });
++    // LOCAL-PATCH 0026b: the hello probe of a local target runs the trusted server `claude` as the service user, outside any agent box, and it
++    // must not load anything an agent can write: only the user settings (see below), never the CLAUDE_CONFIG_DIR of the request.
++    if (localProbe && "CLAUDE_CONFIG_DIR" in localProbe.env && !(config.managedAiConnection && await isManagedAiClaudeConfigDir0026b(localProbe.env.CLAUDE_CONFIG_DIR, ctx.companyId)))
++        delete localProbe.env.CLAUDE_CONFIG_DIR;
+     checks.push(...(await prepareSandboxClaudeProbeRuntime({
+         managedAiConnection: Boolean(config.managedAiConnection),
+         runId,
+@@ -283,8 +304,14 @@
+                     });
+                 }
+             }
++            // LOCAL-PATCH 0026b: a local probe is not run in the box (it also runs before an agent exists, so it has no agent runtime dir to
++            // mount). "claude --print" runs the hooks of the project settings (.claude/settings.json, settings.local.json) found in its working
++            // directory, and an agent writes its workspace; the request alone decides which config is tested, so the probe cannot depend on it
++            // to tell a boxed agent from an unboxed one. A local probe therefore always loads the user settings only (--setting-sources user)
++            // and runs in an empty private directory, never in the agent's.
++            const probeIsLocal = !targetIsRemote;
+             const args = ["--print", "-", "--output-format", "stream-json", "--verbose"];
+-            if (config.managedAiConnection)
++            if (config.managedAiConnection || probeIsLocal)
+                 args.push("--setting-sources", "user");
+             args.push(...buildClaudeProbePermissionArgs({
+                 dangerouslySkipPermissions,
+@@ -312,14 +339,15 @@
+             // env, because the remote transport owns its own env sanitization.
+             const probeCommand = localProbe?.command ?? command;
+             const probeEnv = localProbe ? localProbe.env : env;
++            const probeCwd = probeIsLocal ? await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-probe-")) : cwd; // LOCAL-PATCH 0026b
+             const probe = await runAdapterExecutionTargetProcess(runId, target, probeCommand, args, {
+-                cwd,
++                cwd: probeCwd,
+                 env: probeEnv,
+                 timeoutSec: helloProbeTimeoutSec,
+                 graceSec: 5,
+                 stdin: "Respond with hello.",
+                 onLog: async () => { },
+-            });
++            }).finally(() => (probeIsLocal ? fs.rm(probeCwd, { recursive: true, force: true }) : undefined)); // LOCAL-PATCH 0026b
+             const parsedStream = parseClaudeStreamJson(probe.stdout);
+             const parsed = parsedStream.resultJson;
+             const loginMeta = detectClaudeLoginRequired({

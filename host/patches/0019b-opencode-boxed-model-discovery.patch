@@ -1,0 +1,46 @@
+--- a/node_modules/@paperclipai/adapter-opencode-local/dist/server/models.js
++++ b/node_modules/@paperclipai/adapter-opencode-local/dist/server/models.js
+@@ -140,6 +140,7 @@
+             timeoutSec: MODELS_DISCOVERY_TIMEOUT_MS / 1000,
+             graceSec: 3,
+             onLog: async () => { },
++            localProcessSandbox: input.localProcessSandbox ?? undefined, // LOCAL-PATCH 0019b: the box of a sandboxed agent (HOME is its box home)
+         });
+         if (result.timedOut) {
+             lastError = new Error(`\`opencode models\` timed out after ${MODELS_DISCOVERY_TIMEOUT_MS / 1000}s.`);
+@@ -170,7 +171,7 @@
+     const cached = discoveryCache.get(key);
+     if (cached && cached.expiresAt > now)
+         return cached.models;
+-    const models = await discoverOpenCodeModels({ command, cwd, env });
++    const models = await discoverOpenCodeModels({ command, cwd, env, localProcessSandbox: input.localProcessSandbox }); // LOCAL-PATCH 0019b
+     discoveryCache.set(key, { expiresAt: now + MODELS_CACHE_TTL_MS, models });
+     return models;
+ }
+@@ -187,8 +188,9 @@
+         cwd,
+         env,
+         refresh: true,
++        localProcessSandbox: input.localProcessSandbox, // LOCAL-PATCH 0019b
+     });
+-    const models = await discoverOpenCodeModels({ command, cwd, env });
++    const models = await discoverOpenCodeModels({ command, cwd, env, localProcessSandbox: input.localProcessSandbox }); // LOCAL-PATCH 0019b
+     if (models.length > 0) {
+         discoveryCache.set(discoveryCacheKey(command, cwd, env), {
+             expiresAt: Date.now() + MODELS_CACHE_TTL_MS,
+@@ -220,6 +222,7 @@
+             command: input.command,
+             cwd: input.cwd,
+             env: input.env,
++            localProcessSandbox: input.localProcessSandbox, // LOCAL-PATCH 0019b
+         });
+     }
+     catch (err) {
+@@ -249,6 +252,7 @@
+                 command: input.command,
+                 cwd: input.cwd,
+                 env: input.env,
++                localProcessSandbox: input.localProcessSandbox, // LOCAL-PATCH 0019b
+             });
+             if (refreshedModels.some((entry) => entry.id === model)) {
+                 return refreshedModels;

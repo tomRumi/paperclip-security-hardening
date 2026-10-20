@@ -238,10 +238,12 @@ class Installers(unittest.TestCase):
         with open(os.path.join(PKG, "host", "itsec", "bin", "itsec-make-manifest")) as f:
             exec(f.read().split("def main")[0].split("import tempfile")[1], ns)
         tree = os.path.join(home, ".paperclip", "cli", "installs", "npm", "2026.1012.0")
+        self.tree_files = 0                      # patched files the manifest records (the table, minus files with only optional markers)
         for rel, markers in ns["TREE_TARGETS"]:
             markers = [m for m in markers if m not in ns["OPTIONAL_MARKERS"]]
             if markers:
                 self.write(os.path.join(tree, rel), "".join(m + "\n" for m in markers))
+                self.tree_files += 1
         os.symlink("installs/npm/2026.1012.0", os.path.join(home, ".paperclip", "cli", "current"))
         for rel in (".claude/settings.json", ".claude/skills/s1/SKILL.md", ".ssh/authorized_keys", ".bashrc", ".config/systemd/user/a.service",
                     ".paperclip/instances/default/companies/c1/agents/a1/.claude/settings.json",
@@ -291,9 +293,10 @@ class Installers(unittest.TestCase):
         # the manifest: root-owned file in /etc/itsec, keyed by the tree as the collector reads it
         with open(self.p("etc/itsec/patch-manifest.json")) as f:
             manifest = json.load(f)
-        self.assertEqual(len(manifest), 9)
+        self.assertEqual(len(manifest), self.tree_files)
+        self.assertGreaterEqual(self.tree_files, 18)                                           # v0.2.0: the adapter and helper files are watched too
         self.assertTrue(all(k.startswith(f"{hp}/.paperclip/cli/current/node_modules/") for k in manifest))
-        self.assertIn(f"wrote {self.p('etc/itsec/patch-manifest.json')}: 9 files", r.stdout)
+        self.assertIn(f"wrote {self.p('etc/itsec/patch-manifest.json')}: {self.tree_files} files", r.stdout)
         # the record --uninstall works from lists every grant
         with open(self.p("etc/itsec/acl-paths")) as f:
             recorded = [l.rstrip("\n").split("\t") for l in f]

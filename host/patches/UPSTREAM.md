@@ -4,24 +4,26 @@ The patches are against the published `dist` JS of Paperclip (2026.1005.0 and 20
 code differs). Upstream is TypeScript, so a PR needs the same change in `src`. The plugin's engine does not pin a version: a patch is used wherever
 it fits the file, and a protection whose target code changed shows "unavailable on this install". Accepted upstream changes drop out of the package.
 
-Site values (workspace roots, base allowlist, read-only paths, Hermes wrapper) are not hard-coded in the patches. Patches 0003 and 0005a read them once at
-startup from the hardening settings file: `$PAPERCLIP_HARDENING_CONFIG`, else `<instance root>/hardening/config.json` (the plugin writes it). They ignore the file (secure generic defaults, one `sandbox_enforcement` warning) unless its real path is outside
+Site values (workspace roots, base allowlist, read-only paths, Hermes wrapper) are not hard-coded in the patches. Patches 0003, 0003b and 0005a read them once at
+startup (0005f re-reads only `remoteExceptions`, with the same trust checks, each time such an agent is about to run) from the hardening settings file: `$PAPERCLIP_HARDENING_CONFIG`, else `<instance root>/hardening/config.json` (the plugin writes it). They ignore the file (secure generic defaults, one `sandbox_enforcement` warning) unless its real path is outside
 `<instance root>/workspaces`, `/projects`, `/companies` and every workspace root, it is a 0600 file owned by the service user, and its directory is owned by that
 user and not group- or world-writable. Without the file they use secure generic defaults. For 0003 only, `PAPERCLIP_SANDBOX_WORKSPACE_ROOT` is still honoured when the file sets no roots.
 
-## Patch set 0001-0016
+## Patch set 0001-0027
 
 | Patch | Target | Purpose |
 |---|---|---|
 | 0001 | adapter-utils `local-process-sandbox` | Sandbox starts on usr-merged hosts (no bind onto the `/bin`, `/lib` symlinks bwrap creates) |
 | 0002 | server `routes/agents` | Agents cannot change sandbox, network, command, instructions or skills keys of an agent (board-only) |
 | 0003 | server `services/heartbeat` | Forces the stored sandbox config at every spawn; drops launch-changing env; refuses workspaces outside the allowed roots |
+| 0003b | server `services/heartbeat` | More spawn-time enforcement: the engine, the state and config redirects and the Paperclip endpoint variables of a run are dropped or reset; a boxed Hermes agent is enforced too; publishes the workspace roots for the box helper |
 | 0004 | adapter-utils `local-process-sandbox` | Allowlist proxy survives a client reset (EPIPE) instead of taking the server down |
-| 0005a | server `services/agents` | New agents (create, hire, import, join) start boxed (Claude CLI engine) with the base allowlist, no create-agent or create-skill right |
+| 0005a | server `services/agents` | New agents (create, hire, import, join) start boxed with a per-type table (CLI engine where the type has an ACP engine, the type's allowlist, no create-agent or create-skill right); env names that redirect the box are removed |
 | 0005b | server `services/heartbeat` | Fail closed: an agent without a sandbox (or a Hermes agent without the wrapper) is refused at spawn |
 | 0005c | server `routes/agents` | New agents get no default task-assign grant |
 | 0005d | server `services/company-portability` | Same for agents created by company import |
 | 0005e | server `services/agent-permissions` | New agents get no default grants (variant for 1012) |
+| 0005f | server `services/heartbeat` | Table-driven admission (replaces the claude/hermes-only rule of 0005b): scoped types need the full box, remote types an admin exception, everything else is refused |
 | 0006a | server `services/heartbeat` | Git worktrees: the repository's common dir is mounted for the run (spawn side) |
 | 0006b | adapter-utils `local-process-sandbox` | Git worktrees: hooks, config and info of the common dir stay read-only (sandbox side) |
 | 0007 | server `routes/pipelines` | Pipeline structure (stages) is board-only; agents may still move work along |
@@ -36,8 +38,19 @@ user and not group- or world-writable. Without the file they use secure generic 
 | 0014 | server `run-dispatch/adapters/postgres` | An "interaction pending" wake counts only while that interaction is still pending and addressed to the agent |
 | 0015 | adapter-utils `local-process-sandbox` | `*:<port>` allowlist entry = any public host on that port, nothing local or private (the "public-web box") |
 | 0016 | adapter-claude-local `execute` | Each boxed agent gets its own Claude config folder (settings, hooks, conversations) |
+| 0017 | adapter-utils `local-process-sandbox` | The shared box helper for adapters (mount guard, trusted URLs, boxed-adapter registry) and a log line for every denied connection |
+| 0019 | adapter-opencode-local `execute` | `opencode_local` runs in the box: own home and state folders per agent, skills copied in |
+| 0019b | adapter-opencode-local `models` | `opencode models` (model discovery) runs in the box |
+| 0019c | adapter-opencode-local `runtime-config` | A boxed run takes `{env:NAME}` values and its config only from the agent's own env, never the server's |
+| 0019d | adapter-opencode-local `test` | The "Test environment" probes run in the box, and a local probe starts the server's own OpenCode, never the command of the request |
+| 0025 | adapter-utils `server-utils` | A boxed child gets a fixed list of variables plus the names its adapter lists, not the server's environment |
+| 0026 | adapter-claude-local `execute` | `claude_local` runs through the shared box helper and the environment scrub |
+| 0026b | adapter-claude-local `test` | The "Test environment" probe of a local target always loads user settings only, runs in an empty folder (no project hooks) and ignores a `CLAUDE_CONFIG_DIR` that is not the managed AI connection's home |
+| 0026c | adapter-claude-local `acp` | The same for the ACP probe |
+| 0027 | server `routes/agents` | `POST /companies/:id/adapters/:type/test-environment` is for board users only (an agent with the create-agents right was enough before) |
 
-In the plugin, the switches map to the patches as: Sandbox compatibility 0001, 0004, 0006a/b, 0012, 0014; own box 0002, 0003, 0008; only boxed agents 0005b;
+In the plugin, the switches map to the patches as: Sandbox compatibility 0001, 0004, 0006a/b, 0012, 0014; own box 0002, 0003, 0003b, 0008; box Claude agents 0017, 0025, 0026, 0026b, 0026c;
+box OpenCode agents 0019, 0019b, 0019c, 0019d (needs box Claude agents); only boxed agents 0005b, 0005f, 0027;
 safe defaults 0005a, 0005c, 0005d, 0005e, 0010; no permission handing 0009, 0011a/b; pipeline 0007; assign grant 0013a/b; public-web box 0015; own Claude folder 0016.
 Separate PRs are suggested per numbered section below (0014-0016 are described at the end).
 
@@ -163,13 +176,15 @@ let it run with no sandbox. (b) The hire approval payload stores the redacted di
 **0005a.** `create()` and `activatePendingApproval()` call `applyNewAgentSafeDefaults()`: `canCreateAgents=false`;
 for `claude_local`: `engine=cli` (see below), `filesystemScope=workspace`, `filesystemSandboxCommand=/usr/bin/bwrap`, base
 `filesystemExtraPaths` (the settings file's `extraReadOnlyPaths`, for example a credential broker's `/opt/vault/bin`), `networkScope=allowlist` with only the settings file's `baseAllowlist` (default `api.anthropic.com`); for `hermes_local`: `command` = the settings file's `hermesWrapperPath` (default `/usr/local/bin/hermes-sandbox`) and `env.HERMES_SANDBOX_ALLOW` (`hermesAllowlist`, default `openrouter.ai`; **no other model-provider host unless you configure one**) plus `env.HERMES_SANDBOX_RO` (`hermesReadOnlyPaths`, which must list the Hermes install directories). All of these come from the settings file, read once at startup (`$PAPERCLIP_HARDENING_CONFIG`, else `<instance root>/hardening/config.json`); an empty or missing value falls back to the secure default. The patch ignores creator-supplied
-values for those keys (warn log `event=new_agent_defaults`); other adapter types (e.g. `codex_local`) only get `canCreateAgents=false`. Constants live in the `NEW_AGENT_SAFE_DEFAULTS` block of
+values for those keys (warn log `event=new_agent_defaults`); the table `NEW_AGENT_BOX_PROFILES` (equal to the plugin's `BOX_PROFILES`; a test compares them) gives every other scoped local type (v0.2.0: `codex_local`, `opencode_local`, `gemini_local`, `cursor`, `pi_local`, `kimi_local`, `grok_local`) the same scopes, its own allowlist (the `baseAllowlists[type]` setting, else the provider's own API hosts; for `opencode_local` the four common provider hosts `openrouter.ai`, `api.anthropic.com`, `api.openai.com`, `generativelanguage.googleapis.com`) and, where the type has an ACP engine, `engine=cli`; other types (remote, gateway, process) only get `canCreateAgents=false`. Constants live in the `NEW_AGENT_SAFE_DEFAULTS` block of
 the patched server file (not agent-writable). Board PATCH (`updateAgent`) is untouched, so extra hosts are added later;
 existing agents are not modified.
 
-*Engine (claude_local).* The adapter's `engine` default is `auto`, which means ACP (`adapter-claude-local` `config-schema.js`: "Default (ACP)"; `acp.js` `normalizeEngine()` maps an unset, empty, `auto` or unknown value to ACP, not explicit). `resolveClaudeExecutionEngineForRun()` (`acp.js`, called from `execute.js` before anything is spawned) returns an `adapter_engine_unavailable` error for every non-`cli` selection when `filesystemScope` or `networkScope` is set: "Local filesystem/network confinement requires the Claude CLI engine; ACP confinement is not supported." Without the engine key, a new agent boxed by this patch would be refused at its first run. So `applyNewAgentSafeDefaults()` sets `engine=cli` when the creator's value is missing or not an explicit engine (`auto`, empty, non-string, unknown). **An explicit `cli` or `acp` is kept** (the adapter compares trimmed and lower-cased; the value is stored as given): this is the one key the patch does not overwrite, because it is not a security setting. An explicit `acp` on a boxed agent is refused at run time with the message above (fail closed, never unboxed), and the board fixes it by setting `engine=cli`. Verified on 2026.1012.0 (`adapter-claude-local` 2026.1012.0, `dist/server/acp.js:19-46`, `execute.js:260-274`). The plugin's compliance check (`checkAgent`) does not flag the engine: an ACP boxed agent is a function problem, not a security gap; the ITSec check (`checkItsecAgent`) requires `cli`, as does the ITSec declaration.
+*Engine (claude_local).* The adapter's `engine` default is `auto`, which means ACP (`adapter-claude-local` `config-schema.js`: "Default (ACP)"; `acp.js` `normalizeEngine()` maps an unset, empty, `auto` or unknown value to ACP, not explicit). `resolveClaudeExecutionEngineForRun()` (`acp.js`, called from `execute.js` before anything is spawned) returns an `adapter_engine_unavailable` error for every non-`cli` selection when `filesystemScope` or `networkScope` is set: "Local filesystem/network confinement requires the Claude CLI engine; ACP confinement is not supported." Without the engine key, a new agent boxed by this patch would be refused at its first run. So `applyNewAgentSafeDefaults()` stores `engine=cli` for every new agent of a type with an ACP lane (`claude_local`, `codex_local`, `gemini_local`, `kimi_local`), **whatever the creator sent, an explicit `acp` or `cli` included** (v0.2.0; v0.1.1 kept an explicit value). The spawn-time enforcement (0003/0003b) restores a run's `engine` to the STORED value and the admission (0005f) requires the stored value to be `cli`, so a stored `acp` would be trusted for every later run, and the ACP lane never sees the box. The board can still change it later with a PATCH; an ACP boxed agent is then refused at run time with the message above (fail closed, never unboxed). Verified on 2026.1012.0 (`adapter-claude-local` 2026.1012.0, `dist/server/acp.js:19-46`, `execute.js:260-274`). The plugin's compliance check (`checkAgent`) does not flag the engine: an ACP boxed agent is a function problem, not a security gap; the ITSec check (`checkItsecAgent`) requires `cli`, as does the ITSec declaration.
 
-**0005b.** `refuseUnsandboxedLocalAgent()`, called right after the 0003 hook, refuses the run (error `Sandbox policy: run refused, ...`, warn log
+*Creator-supplied env (v0.2.0).* The enforcement of 0003 lets a run's env value through when it equals the STORED plain value, so a value stored at creation stays trusted for every later run: a creator-supplied `CODEX_HOME=~/.codex`, `HERMES_SANDBOX_PASS=DATABASE_URL` or `HERMES_SANDBOX_HOME` would be honoured forever. `applyNewAgentSafeDefaults()` therefore removes, from the env of every new boxed agent (the scoped types and `hermes_local`), every name the enforcement would drop from a run: `*SANDBOX*` (all `HERMES_SANDBOX_*`), `BWRAP*`, loader and node injection (`LD_*`, `DYLD_*`, `GLIBC_TUNABLES`, `NODE_OPTIONS`, `NODE_PATH`), `BASH_ENV`, `ENV`, proxy variables, a `PATH` outside the system directories (or not a plain value), the state and credential-directory redirects (`HOME`, `HERMES_HOME`, `XDG_*`, `OPENCODE_*` except `OPENCODE_AUTH_JSON`, `GEMINI_CLI_HOME`, `PI_CODING_AGENT_DIR`, `KIMI_CODE_HOME`, `CURSOR_HOME`, `CURSOR_DATA_DIR`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`, `PAPERCLIP_*_PROVIDERS`) and the Paperclip endpoints the box trusts (`PAPERCLIP_API_URL`, `PAPERCLIP_RUNTIME_TOOLS_*`). Credentials (API keys, tokens, secret references under any other name) stay. The removed names (never the values) are listed in the `event=new_agent_defaults` warn log as `droppedEnv`. The two rules are copies in two files; a test compares what they flag over a list of names.
+
+**0005b** (v0.1.x rule; since v0.2.0 the function body is replaced by 0005f, section 22). `refuseUnsandboxedLocalAgent()`, called right after the 0003 hook, refuses the run (error `Sandbox policy: run refused, ...`, warn log
 `event=sandbox_enforcement action=refuse_unsandboxed`) for: `claude_local` without a stored
 `filesystemScope` (the only adapter that implements it); `hermes_local` whose stored `command` is not
 `/usr/local/bin/hermes-sandbox`; every other adapter type, `codex_local` included (no sandbox implementation exists for process, http,
@@ -342,3 +357,67 @@ Patch: `0016-per-agent-claude-config.patch` (adapter-claude-local `server/execut
 **Problem.** Every sandboxed Claude agent of every company mounted the same read-write Claude config folder: shared conversations, settings and hooks.
 
 **Fix.** A boxed agent gets its own folder under its runtime state dir (mode 0700), seeded once with only the theme from the shared `settings.json`; credentials and conversations are never copied. Authentication stays with `CLAUDE_CODE_OAUTH_TOKEN`. Managed AI connections keep the old behaviour.
+
+## 17. Shared box helper (0017)
+
+Patch: `0017-boxed-sandbox-helper.patch` (adapter-utils `local-process-sandbox.js`).
+
+**Problem.** Paperclip's sandbox is wired by hand into the Claude and Codex adapters. Each adapter builds its own mount list and trusted URLs, mounts whatever `filesystemExtraPaths` says (including the home directory, the database or another agent's folder), and nothing records which adapter types are really boxed. A denied connection leaves no trace.
+
+**Fix.** One entry point, `boxedSandboxOptions(...)`, that an adapter passes as `localProcessSandbox` to its spawn call; `ensureBoxedRuntimeDir(dir)` makes the agent's runtime folder (0700); `registerBoxedAdapter(type)` announces the type.
+
+* *Trusted URLs.* The proxy's extra trusted URLs (`networkTrustedUrls`) come only from the `trustedUrls` input, which the adapter fills with the Paperclip API URL and runtime-tools endpoints it computed itself. They are never read from `env.PAPERCLIP_API_URL`, which `config.env` can override. An entry that is not an http(s) URL makes the call throw.
+* *Home and instance guard.* Every mounted path (workspace, runtime dir, managed and extra paths) is resolved through symlinks first and refused when it contains the home directory, or lies inside the home or the instance directory (`$PAPERCLIP_HOME/instances/<id>`) unless it is below the instance's `workspaces` or `projects`, below this agent's own `companies/<companyId>/agents/<agentId>` directory, or below a workspace root. A workspace root that holds the home or the whole instance is ignored. The adapter passes `agentId` and `companyId`; without them nothing under `companies/` can be mounted.
+* *Frozen registry.* The boxed-adapter registry is a `{has, add}` object defined once on `globalThis[Symbol.for("paperclip.hardening.boxedAdapters")]` (not writable, not configurable); `add` takes only the known type names. The admission (0005f) asks `registry.has(type)`.
+* *Denied connections.* One structured log line per refused proxy target: `event=sandbox_network_denied`, `agentId`, `runId`, `host`, `port` (no path or query; the host is sanitised because the agent chooses it), at most 20 per run, then one line with `rateLimited:true`.
+* *Operator-visible change.* An extra read-only path inside the home or the instance is refused for boxed types; paths such as `/opt/...` are unaffected.
+
+## 18. Environment scrub (0025)
+
+Patch: `0025-sandbox-env-scrub.patch` (adapter-utils `server-utils.js`).
+
+**Problem.** Adapters build the child environment as `{ ...process.env, ...agentEnv }`, so a boxed child inherits the server's database URL, API keys and `NODE_OPTIONS`; the sandbox builder cannot tell them from the agent's own credentials.
+
+**Fix.** A confined child gets BASE (`PATH`, `HOME`, `LANG`, `LC_*`, `TZ`, `TERM`, proxy names) plus the names the adapter lists in `localProcessSandbox.envPassNames` (the keys of the adapter's own env object; `boxedSandboxOptions` fills it). A missing or malformed list passes BASE only. `HOME` is always set by the scrub itself (the box home, else the server's). A listed `PAPERCLIP_*` name passes only when its value differs from the server's own (`PAPERCLIP_API_URL` excepted) and never when it looks like a secret or key. `NODE_OPTIONS`, `NODE_PATH`, `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`, `GLIBC_TUNABLES` and `PYTHON*` are never passed. The patch announces itself on `Symbol.for("paperclip.hardening.envScrub")` (value `true`, not writable); the admission refuses a boxed type without it. The names are read when the child starts, so an adapter that adds variables after building the box re-sets the list right before the spawn.
+
+## 19. OpenCode in the box (0019, 0019b, 0019c, 0019d)
+
+Patches: `0019-opencode-boxed-run.patch` (`execute.js`), `0019b-opencode-boxed-model-discovery.patch` (`models.js`), `0019c-opencode-boxed-runtime-config.patch` (`runtime-config.js`), `0019d-opencode-boxed-environment-test.patch` (`test.js`), all in adapter-opencode-local.
+
+**Problem.** `opencode_local` has no sandbox settings. It runs as the server user, with the server's environment, reads `~/.config/opencode` and writes its state into the server user's home.
+
+**Fix.** With `filesystemScope` or `networkScope` on the agent, the run goes through 0017 and 0025. The agent's home is `<instance>/companies/<company>/agents/<agent>/opencode-runtime/home` (config, data, cache, state; two agents never share one). A fixed box environment disables the model-list download, auto-update, language-server download and project config. Skills are copied into the box home, not linked, because the box never mounts the skills catalog. A managed AI connection's credential home is used as the box home instead. 0019b runs `opencode models` in the box; 0019c takes `{env:NAME}` placeholders, the provider config and the small model only from the agent's own env (a placeholder with no value is refused up front) and keeps the config copy in the runtime dir; 0019d runs the "Test environment" probes in a throw-away box and skips them, with an error check, when the box cannot be set up. A local probe starts the server's own OpenCode (`PAPERCLIP_OPENCODE_COMMAND`, else `opencode` on the server's PATH), never `command` from the request: that field is just what a Test request says it is. The managed AI connection's credential home is accepted as the box home only when it is a direct child of the temp dir named `paperclip-ai-<company>-...`.
+
+**Defaults and credentials.** A new agent's allowlist is the four common provider hosts (0005a, `baseAllowlists.opencode_local` overrides). API keys reach the CLI only from the agent's own secrets: `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`.
+
+## 20. Claude in the box (0026, 0026b, 0026c)
+
+Patches: `0026-claude-boxed-adapter.patch` (`execute.js`), `0026b-claude-test-probe-project-settings.patch` (`test.js`), `0026c-claude-acp-probe-project-settings.patch` (`acp.js`), all in adapter-claude-local.
+
+**Problem.** Stock `claude_local` builds its own sandbox object, passes the server's environment to the box, trusts `env.PAPERCLIP_API_URL` after `config.env` is merged, and its "Test environment" probe runs `claude --print` in the agent's workspace: the hooks of a `.claude/settings.json` written by the agent would run as the service user, outside the box.
+
+**Fix.** 0026 moves the adapter onto 0017 and 0025: the box gets the agent and company id, the trusted URLs the adapter computed itself, the managed prompt cache read-only, and the child sees BASE plus the keys of the adapter's own env (re-set right before each spawn, because workspace variables are added after the box is built). The version probe and `claude login` run in the same box. 0026b and 0026c make every probe of a local target use `--setting-sources user` in an empty temporary folder, whatever the request's config says (a request without a sandbox scope is just as able to carry a workspace with hooks), and drop the request's `CLAUDE_CONFIG_DIR` unless it is the credential home the server made for a managed AI connection of the company (`<tmp>/paperclip-ai-<company>-<grant>-*/provider`); the probe then uses the server's own Claude folder. A side effect for operators: the probe ignores the project's Claude settings and the agent's own Claude folder, so it can differ from a real run.
+
+## 21. More spawn-time enforcement (0003b)
+
+Patch: `0003b-hermes-engine-env-redirects.patch` (server `services/heartbeat.js`, extends 0003).
+
+**Problem.** 0003 restores the stored sandbox keys and drops launch-changing environment, but a run-level value could still move a CLI's home or config (`HOME`, `XDG_*`, `OPENCODE_*`, `GEMINI_CLI_HOME`, ...), switch a boxed agent to the ACP engine, point the box's trusted URL at another host (`PAPERCLIP_API_URL`), or change what a Hermes agent's wrapper does. A boxed Hermes agent had no spawn-time enforcement at all.
+
+**Fix.** A run-level value (issue assignee, project, routine, environment, run adapterConfig) for these names is compared with the stored plain value: equal is kept; a stored value comes back; otherwise the variable is removed. Each action is logged (`event=sandbox_enforcement action=drop_env|restore_env`). Covered: the state redirects of every profile (`stateEnv` of the plugin's `BOX_PROFILES`; a drift test compares the lists), `HOME`/`XDG_*`, `PAPERCLIP_*_PROVIDERS`, `PAPERCLIP_API_URL`, `PAPERCLIP_RUNTIME_TOOLS_*`, all `HERMES_SANDBOX_*` and `HERMES_HOME`, and the key `engine`. The server's own per-run credential home of a managed AI connection is exempt for exactly the names the server's `managedAiHomeEnvironment()` sets (`HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `CODEX_HOME`, `GROK_HOME`, `CLAUDE_CONFIG_DIR`); any other state or provider-routing name stays dropped in a managed run too. A boxed Hermes agent (stored `command` equals the wrapper) gets the same cwd check as the scoped types, `command` and `hermesCommand` are restored, and the wrapper path is read once at startup. The workspace roots the server enforces are published for 0017 (`Symbol.for("paperclip.hardening.workspaceRoots")`, frozen); a second copy of the module that publishes a different value makes the server refuse to start.
+
+## 22. Table-driven admission (0005f)
+
+Patch: `0005f-table-driven-admission.patch` (server `services/heartbeat.js`, replaces the rule body of 0005b).
+
+**Problem.** 0005b admitted `claude_local` with a `filesystemScope` and `hermes_local` with the wrapper, and refused everything else. Adding a boxed adapter meant editing the rule, and it did not check that the adapter was really set up for the box.
+
+**Fix.** A table (`SANDBOX_ADMISSION_0005F`, equal to the plugin's `BOX_PROFILES`) lists the scoped types. A scoped agent needs all of: `filesystemScope: "workspace"`, a `networkScope` of `deny` or `allowlist`, `engine: "cli"` for types with an ACP engine, the adapter registered through 0017 in this process, and the environment scrub of 0025 loaded. In v0.2.0 only `claude_local` and `opencode_local` register, so `codex_local`, `gemini_local`, `cursor`, `pi_local`, `kimi_local` and `grok_local` are refused ("the adapter is not registered as boxed in this server"); their patches are planned for later versions and need no change to the rule. `hermes_local` needs `command` and, when set, `hermesCommand` to be the wrapper. `cursor_cloud`, `openclaw_gateway`, `hermes_gateway`, `http` and `process` run only when `remoteExceptions` of the hardening settings file lists the agent id and type; the file is read again, with the checks of 0003, at each such run (an untrusted file means no exceptions), and every admitted run logs `event=sandbox_remote_exception_used`. Any other type is always refused. The refusal names every missing piece (`Sandbox policy: run refused, ...`).
+
+## 23. The "Test environment" route is for board users (0027)
+
+Patch: `0027-adapter-test-board-only.patch` (server `routes/agents.js`).
+
+**Problem.** `POST /companies/:companyId/adapters/:type/test-environment` starts the adapter's probes (a CLI hello turn, model discovery) on the server as the service user, outside any agent box, from the `adapterConfig` in the request. The route only asked for the right to create agents (`assertCanCreateAgentsForCompany`), which every CEO-role agent has, so an agent could ask for a probe of a config of its choosing (a workspace it wrote, a `CLAUDE_CONFIG_DIR` it wrote, an OpenCode `command`).
+
+**Fix.** The first statement of the handler refuses every actor that is not a board user (403, code `adapter_test_board_only`, logged as `event=adapter_test_environment_denied`). The probes were also hardened by 0026b, 0026c and 0019d so that a board user's request cannot be steered by files an agent wrote. Agent flows that call the route themselves (none are known) would be refused.

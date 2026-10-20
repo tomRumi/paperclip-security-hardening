@@ -10,10 +10,10 @@ from giving itself more power, and tells you when someone tampers with the prote
 
 In plain words:
 
-* **The host and its secrets.** An agent's tools see only their workspace, and reach only the network hosts you allow.
+* **The host and its secrets.** An agent's tools see only their workspace, and reach only the network hosts you allow. Claude and OpenCode agents also run with a cleared environment: the server's own variables (database URL, API keys, tokens) never reach them, only the credentials bound to the agent itself.
 * **The box itself.** An agent cannot change its own sandbox, network list, commands, instructions or skills. The stored box is forced again at every run, and a hidden `***REDACTED***` value can never overwrite real settings.
 * **Unboxed runs.** An agent without a box is refused instead of running unprotected.
-* **New agents.** Every new agent (hire, import, join) starts boxed, with no permissions and unable to create agents or skills. A new boxed Claude agent also starts on the Claude CLI engine: Paperclip's default engine (ACP) refuses to run inside a box. An engine chosen explicitly at creation is kept.
+* **New agents.** Every new agent (hire, import, join) starts boxed, with no permissions and unable to create agents or skills. Agent types that have an ACP engine (Claude, Codex, Gemini, Kimi) always start on the CLI engine, whatever the creator sent: Paperclip's default engine (ACP) refuses to run inside a box, and a stored ACP value would be trusted for every later run. Names that would move an agent's home or state directory, or change how the box starts, are removed from a new agent's environment.
 * **Power and structure.** Agents cannot hand out permissions, cannot change a pipeline's stages, and can assign work to others only with an explicit grant.
 * **Privacy between agents.** Each agent's Claude settings and conversations are its own.
 * **Cost.** Daily token caps per agent and per company pause runaway agents and say why.
@@ -30,20 +30,71 @@ Paperclip already has a sandbox mode for local agents. It is set per agent in th
 * `networkScope: "deny"` blocks all network access. `networkScope: "allowlist"` allows only the hosts in `networkAllowlist` (exact host names, `host:port` entries or origin URLs, no wildcards), through a filtering proxy.
 * `filesystemExtraPaths` adds host paths to the box, and `filesystemSandboxCommand` names the `bwrap` binary.
 
-Both scopes are off by default. They need `bwrap` and, for `claude_local`, `engine: "cli"` (the ACP engine is rejected).
+Both scopes are off by default. They need `bwrap` and, for the types that have an ACP engine, `engine: "cli"` (the ACP engine is rejected).
 
-The built-in mode exists only in the `claude_local` and `codex_local` adapters. `opencode_local`, `pi_local`, `gemini_local`, `grok_local`, `kimi_local`, `cursor_local`, the Hermes adapters and the others have no such settings. This is the case in Paperclip 2026.1012.0 and in the upstream source at commit `cde944e` (19 October 2026).
+Paperclip 2026.1012.0 (and the upstream source at commit `cde944e`, 19 October 2026) implements this mode only in the `claude_local` and `codex_local` adapters, and even there the boxed process inherits the server's environment. `opencode_local`, `pi_local`, `gemini_local`, `grok_local`, `kimi_local`, `cursor_local`, the Hermes adapters and the others have no such settings.
 
-This plugin uses that sandbox and does not replace it. It exists because, in 2026.1012.0 and at that upstream commit, the sandbox alone leaves these gaps:
+This plugin uses that sandbox and does not replace it. It extends it to `opencode_local`, gives the boxed `claude_local` and `opencode_local` agents a cleared environment, and closes these gaps:
 
 | Gap in Paperclip's own behaviour | Closed by |
 |---|---|
 | An agent may edit its own adapter settings. Paperclip stops agents from changing the command keys (`command`, `args`, `env`, `cwd`, `filesystemSandboxCommand`) but not the sandbox keys, so a prompt-injected agent could widen or remove its own box. | "Agents can't change their own box" |
 | Nothing requires a sandbox: an agent with no scope set runs with the full access of the account that runs Paperclip. | "Only boxed agents run" |
+| A boxed child process inherits the server's environment: database URL, API keys, secrets master key, `NODE_OPTIONS`. | "Box Claude agents" and "Box OpenCode agents" |
+| `opencode_local` has no sandbox settings at all. | "Box OpenCode agents" |
+| The board's "Test environment" button starts the adapter's probes on the server, outside any box, from the settings in the request, and any agent that may create agents can press it. | "Only boxed agents run" (board users only) and the box patches (the probes ignore files an agent wrote) |
 | An agent that has to read arbitrary websites cannot use `networkAllowlist`, which takes exact host names only. It runs without a network scope, on the host network, where the embedded database (127.0.0.1, default port 54329) is reachable. | "Public-web box" (any public website, nothing local) |
 | With the sandbox on, `claude_local` mounts one Claude config folder read-write into every agent's box, so all agents share the same settings, login and conversation history. | "Own Claude folder per agent" |
 | Any active agent can assign work to any other agent of its company unless the company has a restrictive assignment policy. | "Assigning work needs a grant" |
 | New agents get no sandbox settings and a broad set of default permissions (for example configuring agents, creating skills, assigning work; an agent created directly may also create agents). | "Safe defaults for new agents" and "Agents can't hand out permissions" |
+
+## What runs where
+
+"Only boxed agents run" decides, when a run starts, from the agent's stored settings. This is what it does for each adapter type in this release:
+
+| Adapter type | What happens | What you do |
+|---|---|---|
+| `claude_local` | Runs in the box (bubblewrap, allowlisted network, own folders) with a cleared environment. | New agents start this way. Bind a Claude credential as an agent secret (see "Credentials"). |
+| `opencode_local` | The same: runs in the box with its own home and state folders, a cleared environment, and the common LLM provider hosts on its allowlist. | New agents start this way. Install the `opencode` CLI and bind a provider key (see "Setting up an OpenCode agent"). |
+| `hermes_local` | Runs through the root-owned Hermes sandbox wrapper (one-line install below). The command and the working directory are checked at every start. | Install the wrapper. The agent's working directory must lie below a workspace root (see "Known limits"). |
+| `cursor_cloud`, `openclaw_gateway`, `hermes_gateway`, `http`, `process` | These run on someone else's machine or outside any box, so there is nothing to put in a box. Refused unless an administrator lists the agent as a remote exception. | Add the agent under "Remote exceptions" (below), if you accept that it runs unprotected. |
+| `codex_local`, `gemini_local`, `cursor`, `pi_local`, `kimi_local`, `grok_local` | Refused for now: the run does not start and fails with a message naming what is missing. Boxing for these is planned for later versions. | Nothing yet. Switching "Only boxed agents run" off lets them run with whatever settings they have, unprotected by this plugin. |
+| Anything else (`paperclip_runner`, `acpx_local`, adapter plugins, unknown types) | Always refused, and an exception is not possible. | - |
+
+Runs placed on a remote execution target (SSH or a sandbox provider) are not checked.
+
+### Cleared environment
+
+A process that Paperclip starts for a Claude or OpenCode agent is normally given the server's whole environment. With "Box Claude agents" (and "Box OpenCode agents" for OpenCode) on, it gets only a short fixed list of harmless variables (`PATH`, `LANG`, `TERM` and the like, and a `HOME` inside the agent's own folder) plus what belongs to that agent: the secrets bound to it and the `PAPERCLIP_*` variables of the current run (run id, API URL, the run's token). Variables that change how a program loads code or starts (`NODE_OPTIONS`, `NODE_PATH`, `LD_*`, `BASH_ENV`) are never passed, and neither are `PAPERCLIP_*` variables that look like secrets. So `DATABASE_URL`, the secrets master key or an `ANTHROPIC_API_KEY` that happens to be set for the server do not reach the agent.
+
+At every start the server also drops run-level values (from an issue, project, routine or environment) that would move an agent's home, config or state folder (`HOME`, `XDG_*`, `OPENCODE_*`, `CLAUDE_CONFIG_DIR` and the like), change the Paperclip API address the box trusts, or switch the engine to ACP. The agent's own stored values stay; run-level ones that differ are removed or reset, and each action is logged (`event=sandbox_enforcement`).
+
+### Credentials
+
+An agent gets its model credentials only from secrets bound to the agent, never from the server's environment. In Paperclip, create the secret, then bind it to the agent as an environment variable with the **exact name** below (the board's UI may suggest a different default name; correct it). Through the API the binding is a `PATCH /api/agents/<id>` with:
+
+```
+{"adapterConfig":{"env":{"CLAUDE_CODE_OAUTH_TOKEN":{"type":"secret_ref","secretId":"<secret id>","version":"latest"}}}}
+```
+
+* **`claude_local`:** `CLAUDE_CODE_OAUTH_TOKEN` (a Claude subscription token) or `ANTHROPIC_API_KEY`.
+* **`opencode_local`:** any of `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` (also `GOOGLE_API_KEY`), whichever provider the agent's model uses.
+* Never put a key in the server's environment expecting agents to pick it up: they will not, and keys there are what this protection keeps away from them.
+
+### Setting up an OpenCode agent
+
+1. Install the `opencode` CLI as the account that runs Paperclip (for example `npm install -g opencode-ai`, or the install method on opencode's own site), and check that `opencode --version` works for that account.
+2. Create a secret holding your provider key and bind it to the agent as `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `GEMINI_API_KEY`.
+3. Create the agent with adapter type `opencode_local` and a model of that provider (for example `openrouter/<model>`). With "Safe defaults for new agents" on, it starts boxed: own folders under its runtime directory, no permissions, and a network allowlist of the common provider hosts (`openrouter.ai`, `api.anthropic.com`, `api.openai.com`, `generativelanguage.googleapis.com`). To list only the hosts you use, set "Base allowlist for new OpenCode agents" in the Hardening page settings; for an existing agent, change `networkAllowlist` through the board.
+4. Press "Test environment" on the agent: the probes run inside the same box and start the server's own `opencode` (`PAPERCLIP_OPENCODE_COMMAND`, else `opencode` on the server's PATH), never a command written in the request. Run an issue to confirm.
+
+OpenCode agents run only while **"Box OpenCode agents"** is on (it needs "Box Claude agents"). With it off, an OpenCode agent is refused with "the opencode_local adapter is not registered as boxed in this server", and Claude agents are unaffected.
+
+A connection the agent's tools try to open to a host that is not on the allowlist is refused and logged once as `sandbox_network_denied` (agent id, run id, host, port; at most 20 lines per run), so a missing host shows up in the server log.
+
+### Remote exceptions
+
+To let a remote or gateway agent run anyway, an instance admin lists it on the Hardening page, **Settings, Remote exceptions**: one line per agent, `<agent id> <type> <reason>`. The type must be one of `cursor_cloud`, `openclaw_gateway`, `hermes_gateway`, `http`, `process`, and the reason is required. The plugin records who added the line and when. The server re-reads the settings file at every start of such a run, so an exception applies without a restart (the file has to pass the trust checks described under "Site values"; if it does not, there are no exceptions). Every run admitted this way is logged as `sandbox_remote_exception_used`. An exception exempts that one agent from the box; nothing else about it changes. The Agent boxes page shows such an agent as excepted, and every change to the list is logged. Removing the line stops the agent at its next run.
 
 ## Assumptions
 
@@ -51,7 +102,7 @@ This plugin uses that sandbox and does not replace it. It exists because, in 202
 * Linux, `bwrap` (bubblewrap) and Node as shipped with Paperclip. GNU `patch` on the PATH. `systemd` is optional (it gives the plugin a restart button).
 * Paperclip started the way `paperclipai service install` or `paperclipai run` starts it: `node <install>/node_modules/paperclipai/dist/index.js run`. The plugin works out which install, instance and settings file it serves from that running server process (see "Which Paperclip" below); any other layout (a Docker image, pm2, a `tsx` dev run) is refused, and the command-line tool covers it.
 * Paperclip in authenticated mode on a private network, sign-up disabled, board approval for new agents.
-* Agents use `claude_local`, and optionally `hermes_local` through the wrapper. Other local adapters are refused by "Only boxed agents run" (see "Known limits").
+* Agents use `claude_local` or `opencode_local`, and optionally `hermes_local` through the wrapper. Remote and gateway types need an admin exception, and the other local adapters are refused by "Only boxed agents run" (see "What runs where").
 
 ## Requirements
 
@@ -70,7 +121,7 @@ This plugin uses that sandbox and does not replace it. It exists because, in 202
 2. Get the plugin from a clone of the release tag and install it by path. The plugin is plain ES modules with no build step; it only needs its two
    `@paperclipai` dependencies, which `npm install` fetches. Run this as the account that runs Paperclip (no sudo):
    ```
-   git clone --branch v0.1.1 https://github.com/tomRumi/paperclip-security-hardening
+   git clone --branch v0.2.0 https://github.com/tomRumi/paperclip-security-hardening
    (cd paperclip-security-hardening/plugin && npm install --omit=dev --ignore-scripts)
    paperclipai plugin install "$PWD/paperclip-security-hardening/plugin"
    ```
@@ -99,12 +150,29 @@ If the plugin cannot tell (unsupported launcher, `/proc` hidden by `hidepid`, fi
 
 ### Site values
 
-On the Hardening page, "Settings" holds values that belong to your install (base network allowlist, extra read-only paths, workspace roots, Hermes wrapper path and allowlist, alert company and project, Paperclip URL for the install lines).
+On the Hardening page, "Settings" holds values that belong to your install (base network allowlist, base allowlist for new OpenCode agents, extra read-only paths, workspace roots, Hermes wrapper path and allowlist, remote exceptions, alert company and project, Paperclip URL for the install lines).
 The plugin writes the part Paperclip itself needs to a settings file: the running Paperclip's `$PAPERCLIP_HARDENING_CONFIG`, else `<its instance root>/hardening/config.json`
 (for the default instance `~/.paperclip/instances/default/hardening/config.json`). The patched Paperclip reads it once at startup, so saving settings needs a restart too. Without it, secure generic defaults apply.
 Because it is trusted for allowlists and read-only paths, the patched Paperclip uses it only if no agent run can write it: the file must not be inside the instance's `workspaces`, `projects` or `companies` directory or a workspace root (after resolving links),
 must be owned by the user Paperclip runs as with mode 0600, and its directory must be owned by that user and not writable by group or others. Otherwise it is ignored (secure defaults stay, and a `sandbox_enforcement` warning names the reason).
 The plugin creates the directory with mode 0700 and the file with mode 0600, and refuses to write when an existing file or directory fails these checks. If you set `PAPERCLIP_HARDENING_CONFIG` yourself, point it at such a place.
+
+## Upgrading from v0.1.x
+
+Update as in step 2 of "Install the plugin": in the clone, `git fetch --tags && git checkout v0.2.0`, run `npm install --omit=dev --ignore-scripts` in `plugin/`, and install the same path again with `paperclipai plugin install`. On start the plugin re-plans the switched-on protections against the new patch files: "Box Claude agents" is added (the protection "Only boxed agents run" needs it), the page shows "restart needed", and one restart applies everything. If the new row shows as pending instead, press Save. **Switch "Box OpenCode agents" on** if you use OpenCode agents: an upgrade does not turn it on by itself (v0.1.1 had no OpenCode support), and without it OpenCode agents are refused.
+
+**A safety protection that no longer fits is never dropped silently.** If, on start, a switched-on core protection (the ones marked "safety core") no longer fits the Paperclip files, for example after a Paperclip update that changed the code a patch changes, the plugin rebuilds nothing, raises a HIGH alert and shows the rows as **"update needs admin decision"**. The files stay as they were, so after an update that replaced them none of the protections is in the files until you decide: install a plugin release whose patches fit this Paperclip (it applies on the next start), or press Save and confirm that you accept the risk of rebuilding without the listed protections. A protection that is not a safety core and no longer fits is left out as before ("unavailable on this install"), and the rest is re-applied. Then **paste the watchdog install line from the Hardening page again**: the patched Paperclip files changed, so the watchdog's manifest must be refreshed or it may report them as changed.
+
+What changes for an operator:
+
+* **A Claude agent no longer inherits the server's environment.** One that relied on an `ANTHROPIC_API_KEY` (or any other variable) set for the server loses it. Bind a secret to the agent (see "Credentials"). This includes the ITSec agent, which is a `claude_local` agent.
+* **Run-level overrides are dropped for all boxed agents,** also for Claude agents, which v0.1.1 let through: `HOME`, `XDG_*`, `OPENCODE_*` and the other state and config directories, `PAPERCLIP_API_URL` and `PAPERCLIP_RUNTIME_TOOLS_*`, and `engine`. If a project really needs a different `PAPERCLIP_API_URL` (a container that reaches the API on another address), set it on the agent through the board instead.
+* **Hermes agents are now checked at every start,** like the others: the working directory must lie below a workspace root, the command (and `hermesCommand`) must be the wrapper, and a run cannot change the `HERMES_SANDBOX_*` variables. A Hermes agent whose working directory is outside Paperclip's own `workspaces` and `projects` folders (for example under `~/projects`) needs that directory in **Workspace roots** on the Hardening page, or its runs are refused with "is outside the allowed workspace roots". If you change the Hermes wrapper path later, existing Hermes agents keep the old command and are refused until you `PATCH` their `command` to the new path; new agents get the new path.
+* **Extra read-only paths inside the home directory or the Paperclip instance directory are refused** for boxed agents (for example `~/.local/bin/tool`, or an entry in "extra read-only paths"). Move the tool outside the home, or into a workspace root. Paths such as `/opt/...` are unaffected.
+* **New agents:** the engine is always `cli` for Claude, Codex, Gemini and Kimi agents (v0.1.1 kept an explicit choice), and names that move an agent's home or state directory or change how the box starts are removed from the environment of a new boxed agent. Credentials under other names stay.
+* **Existing agents are not rewritten.** An existing `opencode_local` agent (refused until now) needs the box settings before it runs: `filesystemScope: "workspace"`, `networkScope: "allowlist"` and a `networkAllowlist`. The Agent boxes page shows the exact `PATCH`. The compliance check on the Hardening page also lists agents whose stored environment holds the names that are now dropped, or whose engine is not `cli`; remove them with a `PATCH`.
+* **The "Test environment" button is for board users only.** An agent (for example a CEO-role agent that may create agents) can no longer start it: the server answers 403. The probe also ignores files an agent can write: the workspace's project settings and a `CLAUDE_CONFIG_DIR` from the request (see "Known limits").
+* **Remote and gateway agents** (`cursor_cloud`, `openclaw_gateway`, `hermes_gateway`, `http`, `process`) were refused before and still are, until an admin lists them as remote exceptions.
 
 ## The Hardening page
 
@@ -114,8 +182,10 @@ Admin only. One row per protection, each with an on/off switch (the safety core 
 |---|---|---|
 | Sandbox compatibility | makes the built-in sandbox work reliably (modern Linux layouts, git worktrees, proxy crashes, apps inside a run reachable on localhost, interaction wake-ups) | on (required by most others) |
 | Agents can't change their own box | sandbox, network, commands, instructions and skills are board-only for agents; the stored box is forced again at every run; a hidden `***REDACTED***` value can never overwrite real settings | on |
-| Only boxed agents run | an agent without a sandbox is refused instead of running unboxed | on |
-| Safe defaults for new agents | every new agent (hire, import, join) starts boxed (Claude agents on the CLI engine), with no permissions, unable to create agents or skills | on |
+| Box Claude agents | Claude agents run in the sandbox with their own folders and a cleared environment (the server's secrets do not reach them); sets up the shared sandbox helper OpenCode uses; denied connections are logged | on |
+| Box OpenCode agents | OpenCode agents get a sandbox at all (own folders, cleared environment). Needs "Box Claude agents". While it is off, OpenCode agents are refused; switching it off needs no confirmation because it fails closed | on |
+| Only boxed agents run | an agent without a sandbox is refused instead of running unboxed; remote types need an admin exception, other local types are refused for now; an agent cannot press "Test environment" | on |
+| Safe defaults for new agents | every new agent (hire, import, join) starts boxed (CLI engine where the type has an ACP engine), with no permissions, unable to create agents or skills | on |
 | Agents can't hand out permissions | granting permissions, including "may edit pipelines", is board-only | on |
 | Pipeline structure is board-only | agents can move work along a pipeline but not change its stages | on |
 | Assigning work needs a grant | an agent may assign work to others only with an explicit grant | on |
@@ -129,7 +199,7 @@ Rules the page enforces:
 
 * **Dependencies.** Switching a protection on also switches on what it needs (for example the public-web box needs "Sandbox compatibility" and "Agents can't change their own box"). Switching one off that others need asks first and lists the dependents.
 * **One restart per save.** Changes are collected and applied with a single restart. The page says "restart needed" and offers the button.
-* **Status column.** applied, pending restart, unavailable on this install, self-test failed, or drifted (files changed outside the plugin). "Drifted" is shown on the page only. The plugin raises no alert for it and the self-test skips such a row (it cannot say what the file does); noticing a changed protected file and alerting is the watchdog's job (see "Known limits").
+* **Status column.** applied, pending restart, unavailable on this install, update needs admin decision, self-test failed, or drifted (files changed outside the plugin). "Drifted" is shown on the page only. The plugin raises no alert for it and the self-test skips such a row (it cannot say what the file does); noticing a changed protected file and alerting is the watchdog's job (see "Known limits").
 * **Alerts.** Recent watchdog alerts and caps events, with links to the issues.
 
 ### No version lock
@@ -158,7 +228,7 @@ The plugin creates and manages one security agent, **ITSec**, in the company you
 
 What the plugin sets up, all in the host company:
 
-* **The agent** ("ITSec", `claude_local`, model `claude-sonnet-5-5`) with generic security-stance instructions shipped in this package. It is created **paused**, runs in the sandbox (CLI engine, `bwrap` workspace scope, your base allowlist and read-only paths as on every new agent (so the model API only and no host paths, if you set none), `dangerouslySkipPermissions` left unset so that the adapter's default applies: skip permissions, inside that box), cannot create agents or skills, holds no grants, and has a cap of 30 runs a day on top of the daily token caps.
+* **The agent** ("ITSec", `claude_local`, model `claude-sonnet-5-5`) with generic security-stance instructions shipped in this package. It is created **paused**, runs in the sandbox (CLI engine, `bwrap` workspace scope, your base allowlist and read-only paths as on every new agent (so the model API only and no host paths, if you set none), `dangerouslySkipPermissions` left unset so that the adapter's default applies: skip permissions, inside that box), cannot create agents or skills, holds no grants, and has a cap of 30 runs a day on top of the daily token caps. Like every boxed Claude agent it gets no credential from the server's environment: bind a Claude credential to it as an agent secret (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`, see "Credentials") before its first run.
 * **Two routines.** *ITSec: alert triage* has no schedule of its own: the plugin starts it when an alert of medium priority or higher is raised in the host company, at most once every 30 minutes, and a 15-minute check starts it only when an open alert still has no comment from the agent (otherwise no agent run happens). *ITSec: daily review* is declared to run at 07:00 UTC (the page shows the declared schedule; the live one is on the Routines page of Paperclip).
 * **A status issue** (not an alert, assigned to nobody) holding two documents the plugin keeps current: `hardening-status` (protections, last self-test, watchdog, sandbox compliance of the company's agents, the alerts the ITSec agent closed) and `itsec-context` (your notes about this host). The agent reads its facts from these. Paperclip only updates a document when the caller names the revision it is replacing, and the plugin SDK has no way to do that, so the plugin replaces a changed document (deletes it and creates it again). The documents therefore keep no revision history; do not edit them by hand, the next change overwrites your edit.
 * **Triage, resolve and close, or escalate.** The agent may close an alert of this plugin (set it to done) only after its own resolution comment on that alert, posted as a separate comment before the close, in this format: the first line starts with `Resolution:` and says why the alert is resolved, and a later line starts with `Evidence:` followed by at least 10 characters of what it checked (on that line or below). The plugin's alert re-check (see Known limits) verifies that such a comment exists, was written by the host company's current ITSec agent (in a real agent run, not created by a plugin in its name) and was created before the close, and that the close itself was made by that agent's own run (not by a plugin that names the agent); otherwise it raises the alert again, naming the ITSec agent. An alert whose cause needs a change on the host or in Paperclip is not closed by the agent: it stays open, with a verdict comment and a separate "ITSec proposal" issue that starts with "For the owner:" and names the recommended fix and who applies it. Every alert the agent closed is listed, with time and the first line of its resolution, under "Alerts closed by the ITSec agent" in the `hardening-status` document (and in the activity log), and the daily review copies that list into its comment. Closes by any other agent, by agents of other companies, by users who are not alert owners, or by an old host agent are re-raised as before.
@@ -211,8 +281,16 @@ The same line also gives the watchdog's account read access (`setfacl`) to the f
 ## Self-test
 
 After each restart, a short self-test checks that every switched-on protection really works in the files Paperclip runs, not only that the text is there.
-Four protections are tested functionally (the sandbox builds a spawn target without re-mounting usr-merge symlinks, the public-web box accepts `*:443` and still refuses `*`, a run override that widens the network or escapes the workspace is undone, a new agent created unboxed comes out boxed);
-the rest get a structural check (each file equals the build the plugin recorded and carries its markers). The page says which kind each row got. A failed self-test turns the row red, logs once and raises an alert issue.
+Six protections are tested functionally:
+
+* the sandbox builds a spawn target without re-mounting usr-merge symlinks;
+* the public-web box accepts `*:443` and still refuses `*`;
+* a run override that widens the network, escapes the workspace or switches the engine is undone;
+* a new agent created unboxed comes out boxed;
+* the box around Claude and OpenCode agents works in a real bubblewrap sandbox: a process in it cannot read or write outside its workspace and runtime folder, a host that is not on the allowlist gets a refusal and one `sandbox_network_denied` log line, and the server's own environment does not reach the child while the agent's own variables do (no model call, no credential; where bubblewrap is unusable the page says "not run");
+* the admission rule refuses an unboxed agent, one whose adapter is not set up for the box, one on the ACP engine and an unknown type, naming the missing piece, and admits a boxed Claude and a boxed OpenCode agent.
+
+The rest get a structural check (each file equals the build the plugin recorded and carries its markers). The page says which kind each row got. A failed self-test turns the row red, logs once and raises an alert issue.
 "Run self-test" repeats it on demand.
 
 ## Fallback without the plugin
@@ -254,7 +332,11 @@ If Paperclip was updated meanwhile, a file that changed outside the plugin is le
 
 ## Known limits
 
-* **Only `claude_local` (and `hermes_local` through the wrapper) can run.** "Only boxed agents run" checks the agent's stored settings when a local run starts. A `claude_local` agent needs `filesystemScope` set, a `hermes_local` agent needs the sandbox wrapper as its command, and every other adapter type is refused: the run does not start and fails with `Sandbox policy: run refused, adapter type "<type>" has no sandbox implementation`, with a warning in the server log. That includes `opencode_local`, which has no sandbox in this release, and also `codex_local`: Paperclip's own mode covers it, but this plugin does not check or enforce its settings, so it is refused as well. Runs placed on a remote execution target (SSH or a sandbox provider) are not checked. To run such an agent you have to switch the protection off on the Hardening page (the page asks for confirmation); the agent then runs with whatever sandbox settings it has, and this plugin does not guarantee them.
+* **Only Claude, OpenCode and (through the wrapper) Hermes agents can run boxed.** "Only boxed agents run" checks the agent's stored settings when a local run starts. A `claude_local` or `opencode_local` agent needs `filesystemScope` and `networkScope` set (and, for Claude, `engine: "cli"`), a `hermes_local` agent needs the sandbox wrapper as its command, remote and gateway types need an admin exception, and every other adapter type is refused: the run does not start and fails with a message that names what is missing, with a warning in the server log. **`codex_local`, `gemini_local`, `cursor`, `pi_local`, `kimi_local` and `grok_local` are refused for now, even though Paperclip's own sandbox covers some of them**: this plugin does not yet give them the cleared environment and the folder checks, and boxing them is planned for later versions. Runs placed on a remote execution target (SSH or a sandbox provider) are not checked. To run such an agent today you have to switch the protection off on the Hardening page (the page asks for confirmation); the agent then runs with whatever sandbox settings it has, and this plugin does not guarantee them.
+* **The board's "Test environment" button for a Claude agent ignores the project's Claude settings and the agent's own Claude folder.** An agent writes its workspace and its Claude folder, and `claude --print` would run the hooks it finds in `.claude/settings.json` or in the `settings.json` of `CLAUDE_CONFIG_DIR` as the Paperclip user, outside the box. The probe of a local target therefore always loads the user-level settings only (`--setting-sources user`), runs in an empty temporary folder, and uses a `CLAUDE_CONFIG_DIR` from the request only when it is the credential home the server made for a managed AI connection of that company; otherwise it uses the server user's own Claude folder. It can pass or fail differently from a real run. The probe for an OpenCode agent runs inside the box and starts the server's own `opencode`, not a `command` from the request (a request without sandbox settings runs it unboxed, as the stock test does; such an agent would be refused at run time).
+* **A Claude or OpenCode agent gets no credential from the server's environment.** Credentials come only from secrets bound to the agent, and a run-level `HOME`, `XDG_*`, `OPENCODE_*` or `PAPERCLIP_API_URL` is dropped. See "Upgrading from v0.1.x" for the details. A tool that needs a variable the box does not pass (for example a `GITHUB_TOKEN`) needs it bound to the agent as a secret.
+* **The OpenCode allowlist is a list of provider hosts, not a single one.** The default is the four common LLM API hosts; each is a place a prompt-injected agent could send data to if it holds a key for that provider. Keep only the hosts you use ("Base allowlist for new OpenCode agents"; existing agents keep what they have).
+* **Provider hosts beyond the first run.** A CLI may contact a host the default list does not cover (a login, update or telemetry host). Such a connection is refused and logged as `sandbox_network_denied`; add the host to the agent's `networkAllowlist` if the run needs it.
 * **The Agent boxes page does not write an agent's sandbox settings.** Paperclip's plugin SDK has no way to change an agent's configuration, and the plugin holds no admin credential. The page therefore keeps the plugin-side values and shows the exact change (a `PATCH /api/agents/<id>` body) for an instance admin to apply by hand; the row shows "not applied" until the agent matches. Writing them automatically would need either a narrow extra protection that grants this ability or a stored admin key; neither is built, so the change is always applied by hand.
 * **Plugin actions are callable by company members.** Paperclip lets any company member and the company's agents call a plugin's actions, and tells the plugin who is calling but not whether they are an instance admin. The plugin therefore refuses agents and accepts a user only when an instance admin listed their user id in the plugin's own admin list ("Users who may change protections"). That list gates every write on both pages.
 * **Alert re-checks happen in the plugin, and see closes only while it runs.** The watchdog's signed channel deliberately has no read access to Paperclip's issues, so the plugin re-checks the alert issues it creates (watchdog alerts, a failed self-test, a silent watchdog). For `alertRecheckDays` (default 7, 0 = off) after an alert, the "Alert tamper re-check" job re-reads it every 10 minutes; only the users in `alertOwnerUserIds` (default: the admin list) and, with a valid prior resolution comment, the host company's ITSec agent (see "The ITSec agent") may close it. If anyone else (another agent, another user, or the ITSec agent without such a comment) closes, cancels, deletes or hides it, the plugin opens one new HIGH "[RE-RAISED]" alert naming who did it (at most 3 per alert; it creates a new issue rather than reopening, so it needs no issue-edit right). The plugin SDK cannot read the activity log, so the closer comes from Paperclip's `issue.updated` event: a close made while the plugin worker was down gets one MEDIUM "closer unknown" alert instead, and a deletion's actor is never known. Edits to an alert's text are not checked.
@@ -274,7 +356,7 @@ If Paperclip was updated meanwhile, a file that changed outside the plugin is le
 * The watchdog's alert path runs through the Paperclip instance the agent account hosts. An agent that escapes can silence it; use an independent second channel for high-value setups.
 * Log-based watchdog rules depend on Paperclip's log line formats; check them after updates. Linux only.
 * **The watchdog assumes the standard Paperclip layout.** Its watch list and read access name `~/.paperclip/cli/current` and the instance `default` in the watched user's home. Another layout needs the `watch` list in `/etc/itsec/config.json` edited, and the read access added by hand. Files created later in a watched folder (a new agent's settings, a new skill) are covered after the install line is pasted again.
-* **The Hermes wrapper is fixed to two defaults.** Its first line is `#!/usr/local/bin/node`, so Node must be there (the installer stops with a message if it is not), and it only runs agents whose working directory is under `~/projects` or the `default` instance's `workspaces` and `projects` folders of the account that runs it; it finds Paperclip's sandbox code under that account's `~/.paperclip/cli/current`. Another Node path or instance needs an edited wrapper (its fingerprint then differs from the release, and the plugin shows that).
+* **The Hermes wrapper is fixed to two defaults.** Its first line is `#!/usr/local/bin/node`, so Node must be there (the installer stops with a message if it is not), and it only runs agents whose working directory is under `~/projects` or the `default` instance's `workspaces` and `projects` folders of the account that runs it (the server now also refuses a Hermes run whose working directory is outside the workspace roots; list a directory under "Workspace roots" for the server, and the wrapper's own limit stays); it finds Paperclip's sandbox code under that account's `~/.paperclip/cli/current`. Another Node path or instance needs an edited wrapper (its fingerprint then differs from the release, and the plugin shows that).
 * **The watchdog installs no `lynis`.** Without it (`apt-get install lynis`) the weekly audit timer stays off and a run reports an INFO finding; see [host/itsec/INSTALL.md](host/itsec/INSTALL.md), section 2.
 
 ## Upstreaming
@@ -286,7 +368,7 @@ Each protection is also meant to be offered to the Paperclip project as a pull r
 | Path | What it is |
 |---|---|
 | `plugin/` | the Paperclip plugin (switches, Agent boxes, caps, self-test, engine, fallback CLI, the ITSec agent: `src/itsec.js`, its instructions in `src/itsec/`) |
-| `host/patches/` | the 0001-0016 patch set, `apply.sh`, `cleanup-agent-grants.js` |
+| `host/patches/` | the patch set (0001 to 0026), `apply.sh`, `cleanup-agent-grants.js` |
 | `host/install/` | the one-line installers (`install-watchdog.sh`, `install-hermes-wrapper.sh`) |
 | `host/itsec/` | the watchdog (Python 3 standard library only), systemd units, fail2ban templates |
 | `host/sandbox/` | the `hermes-sandbox` wrapper and optional re-apply units |
@@ -304,7 +386,7 @@ Prerequisites on a Linux host: **Node.js 24.11 or newer** with `npm` (as for Pap
 npm test
 ```
 
-`npm test` at the package root runs the watchdog, installer and plugin tests. Some plugin tests compare the package patches with a hand-patched live Paperclip install; they run only when `HARDENING_LIVE_PATCHES` names the patch directory that install was patched from (and `PAPERCLIP_TREE` its tree), and skip with a message otherwise.
+`npm test` at the package root runs the watchdog, installer and plugin tests. Some plugin tests compare the package patches with a hand-patched live Paperclip install; they run only when `HARDENING_LIVE_PATCHES` names the patch directory that install was patched from, and skip with a message otherwise. The other tests read the original bytes of Paperclip's files from `$PAPERCLIP_STOCK_TREE_<vkey>` (for example `PAPERCLIP_STOCK_TREE_1012`; default `~/.paperclip/cli/installs/npm/2026.<vkey>.0`) and skip with a `NO PRISTINE` message when they cannot find them.
 Patch fit on a given tree: `host/patches/apply.sh --check` (changes nothing).
 
 License: MIT, see [LICENSE](LICENSE).

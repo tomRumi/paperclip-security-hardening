@@ -203,7 +203,20 @@ export function createEngine(options = {}) {
         change: Boolean(b) && builtSha !== f.currentSha, patches: b ? b.used : [],
       };
     });
-    const effective = (p) => state.applied.includes(p.id) && protectionFiles(p).every((rel) => state.files[rel]?.builtSha && state.files[rel].builtSha === files[rel].currentSha);
+    // A protection counts as unchanged only when the file is what the engine built last time AND the patches of this protection
+    // in the planned build are the ones recorded then (same list, same patch file bytes). The file hash alone is not enough: if
+    // the list of patches of a protection grows (a new release adds a patch to it), the file on disk still equals the old build.
+    // A state written before patch hashes were recorded has no hash to compare: then any planned change of the file counts.
+    const patchesCurrent = (p, rel) => {
+      const recorded = state.files[rel];
+      const planned = (built[rel]?.used ?? []).filter((u) => p.patches.includes(u.id));
+      const was = (recorded.patches ?? []).filter((id) => p.patches.includes(id));
+      if (planned.length !== was.length || planned.some((u) => !was.includes(u.id))) return false;
+      if (recorded.patchShas) return planned.every((u) => recorded.patchShas[u.id] === u.sha);
+      return !fileEntries.find((f) => f.rel === rel).change;
+    };
+    const effective = (p) => state.applied.includes(p.id)
+      && protectionFiles(p).every((rel) => state.files[rel]?.builtSha && state.files[rel].builtSha === files[rel].currentSha && patchesCurrent(p, rel));
     const protections = PROTECTIONS.map((p) => {
       const on = closure.has(p.id);
       let action;
@@ -217,7 +230,11 @@ export function createEngine(options = {}) {
     const result = {
       createdAt: new Date().toISOString(), tree, paperclipVersion: version, vkey, patchesDir,
       requested: desired, enabled: order(closure), added, neededOff, unavailable,
-      confirmationNeeded: protections.filter((p) => p.core && p.action === "will-remove").map((p) => ({ id: p.id, title: p.title, risk: getProtection(p.id).risk ?? null })),
+      // A core protection leaves the files in two ways: switched off (will-remove), or switched on but no longer fitting this Paperclip while
+      // it is applied now (an update changed the code its patches change): rebuilding then would silently drop it, which counts as switching
+      // it off. Either way the owner confirms; `unavailable` tells the two apart (and `reason` says why it no longer fits).
+      confirmationNeeded: protections.filter((p) => p.core && (p.action === "will-remove" || (p.action === "unavailable" && state.applied.includes(p.id))))
+        .map((p) => ({ id: p.id, title: p.title, risk: getProtection(p.id).risk ?? null, unavailable: p.action === "unavailable", reason: p.action === "unavailable" ? p.reason : null })),
       protections, files: fileEntries, changes: fileEntries.filter((f) => f.change).length,
     };
     result.restartNeededAfterApply = result.changes > 0;
@@ -257,8 +274,13 @@ export function createEngine(options = {}) {
     const internal = plans.get(planned);
     if (!internal) throw new Error("apply() needs a plan returned by plan() of this engine");
     const fail = (error) => ({ ok: false, error, changed: [], applied: [], unavailable: planned.unavailable });
-    if (planned.confirmationNeeded.length && !confirmCoreOff)
-      return fail(`switching off ${planned.confirmationNeeded.map((p) => `"${p.title}"`).join(", ")} needs confirmation`);
+    if (planned.confirmationNeeded.length && !confirmCoreOff) {
+      const quoted = (list) => list.map((p) => `"${p.title}"`).join(", ");
+      const dropped = planned.confirmationNeeded.filter((p) => p.unavailable);
+      const off = planned.confirmationNeeded.filter((p) => !p.unavailable);
+      return fail([off.length ? `switching off ${quoted(off)} needs confirmation` : null,
+        dropped.length ? `${quoted(dropped)} no longer fit${dropped.length === 1 ? "s" : ""} this Paperclip; rebuilding the files would remove ${dropped.length === 1 ? "it" : "them"}, which needs confirmation` : null].filter(Boolean).join("; "));
+    }
     for (const rel of targets) {
       const cur = readOrNull(path.join(tree, rel));
       if ((cur ? sha256(cur) : null) !== (internal.files[rel].currentSha ?? null)) return fail(`${rel} changed after the plan was made; plan again (nothing was changed)`);
@@ -288,7 +310,8 @@ export function createEngine(options = {}) {
     const files = { ...state.files };
     for (const f of planned.files) {
       if (f.missing || f.blocked) continue;
-      files[f.rel] = { pristineSha: f.pristineSha, builtSha: f.builtSha, patches: f.patches.map((u) => u.id) };
+      files[f.rel] = { pristineSha: f.pristineSha, builtSha: f.builtSha, patches: f.patches.map((u) => u.id),
+        patchShas: Object.fromEntries(f.patches.map((u) => [u.id, u.sha])) };
     }
     const changedAt = { ...(state.changedAt ?? {}) };
     if (changes.length) for (const id of changedIds) changedAt[id] = now;

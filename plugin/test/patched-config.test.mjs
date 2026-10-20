@@ -68,25 +68,23 @@ test("no settings file: secure generic defaults", () => {
 });
 
 // The claude_local adapter's default engine is ACP ("auto"/unset/unknown), and it refuses ACP under a filesystem or network
-// scope (execution engine "requires the Claude CLI engine"). A new boxed agent therefore starts on the CLI engine unless its
-// creator explicitly chose one: an explicit "cli" stays, and so does an explicit "acp" (that agent is refused at run time, which
-// is safe and says how to fix it; the patch does not override a deliberate choice).
+// scope (execution engine "requires the Claude CLI engine"). A new boxed agent therefore starts on the CLI engine. Since v0.2.0
+// that holds whatever the creator sent, an explicit "acp" included: the spawn-time admission and enforcement trust the STORED
+// engine, and the ACP lane never sees the box (v0.1.1 kept an explicit "cli" or "acp").
 for (const name of P0005A) {
-  test(`${name}: a new claude_local agent starts on the CLI engine; an explicit engine is kept`, () => {
+  test(`${name}: a new claude_local agent always starts on the CLI engine, whatever the creator sent`, () => {
     const b5 = evalBlock(pkg0005a(name), "0005a", { instanceRoot: freshRoot() });
     const engineOf = (cfg, source = "create") => b5.applyNewAgentSafeDefaults("claude_local", cfg, {}, source).adapterConfig.engine;
     assert.equal(engineOf({ model: "x" }), "cli", "unset");
-    for (const v of ["auto", "AUTO", "", "  ", "bogus", null, 7, true, {}, []]) assert.equal(engineOf({ engine: v }), "cli", JSON.stringify(v));
-    assert.equal(engineOf({ engine: "cli" }), "cli");
-    assert.equal(engineOf({ engine: "acp" }), "acp");
-    assert.equal(engineOf({ engine: " ACP " }), " ACP ", "kept as given (the adapter trims and lowercases too)");
-    assert.equal(engineOf({ engine: "CLI " }), "CLI ");
+    for (const v of ["auto", "AUTO", "", "  ", "bogus", null, 7, true, {}, [], "acp", " ACP ", "Acp", "CLI ", "cli"]) assert.equal(engineOf({ engine: v }), "cli", JSON.stringify(v));
     assert.equal(engineOf({ model: "x" }, "approval_activation"), "cli", "approval path");
+    assert.equal(engineOf({ engine: "acp" }, "approval_activation"), "cli", "approval path, explicit acp");
     assert.equal(engineOf(undefined), "cli", "no adapterConfig at all");
     // Nothing else changes with it, and other adapter types get no engine key.
     const c = b5.applyNewAgentSafeDefaults("claude_local", creator.claude, {}, "create").adapterConfig;
     assert.deepEqual({ ...c, engine: undefined }, { ...creator.claude, engine: undefined, filesystemScope: "workspace", filesystemSandboxCommand: "/usr/bin/bwrap", filesystemExtraPaths: [], networkScope: "allowlist", networkAllowlist: ["api.anthropic.com"] });
-    for (const type of ["hermes_local", "codex_local"]) assert.equal("engine" in b5.applyNewAgentSafeDefaults(type, { model: "m" }, {}, "create").adapterConfig, false, type);
+    // (the other scoped local types are covered by patch-0005a-profiles.test.mjs: engine "cli" for codex/gemini/kimi)
+    for (const type of ["hermes_local", "cursor_cloud"]) assert.equal("engine" in b5.applyNewAgentSafeDefaults(type, { model: "m" }, {}, "create").adapterConfig, false, type);
   });
 }
 

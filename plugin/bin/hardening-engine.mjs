@@ -111,7 +111,9 @@ function printPlan(plan) {
   for (const a of plan.added) if (!plan.neededOff.some((n) => n.id === a.id)) console.log(`added: ${a.id} (needed by ${a.neededBy.join(", ")})`);
   for (const n of plan.neededOff) console.log(`kept on: ${n.id} is needed by ${n.neededBy.join(", ")}; switch those off too to remove it`);
   for (const p of plan.protections) console.log(`  ${p.action.padEnd(12)} ${p.id}${p.reason ? `  (${p.reason})` : ""}`);
-  for (const c of plan.confirmationNeeded) console.log(`confirm: switching off "${c.title}": ${c.risk}`);
+  for (const c of plan.confirmationNeeded) console.log(c.unavailable
+    ? `confirm: "${c.title}" no longer fits this Paperclip${c.reason ? ` (${c.reason})` : ""}; applying drops it: ${c.risk}`
+    : `confirm: switching off "${c.title}": ${c.risk}`);
   console.log(`${plan.changes} file(s) to rewrite`);
 }
 

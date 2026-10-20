@@ -3,6 +3,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { comparePatchIds } from "./registry.js";
 
@@ -58,7 +59,7 @@ function runPatch(dir, file, dryRun) {
 
 /**
  * Build one target file: pristine bytes + steps in order. steps: [{id, candidates:[{file,vkey}], marker}].
- * Returns {ok:true, content, used:[{id, file}]} or {ok:false, failedId, reason, used}.
+ * Returns {ok:true, content, used:[{id, file, sha}]} or {ok:false, failedId, reason, used}.
  */
 export function buildFile({ rel, pristine, steps, tmpDir }) {
   const root = fs.mkdtempSync(path.join(tmpDir ?? os.tmpdir(), "hardening-build-"));
@@ -83,7 +84,8 @@ export function buildFile({ rel, pristine, steps, tmpDir }) {
         return { ok: false, failedId: step.id, used,
           reason: `patch ${step.id} does not fit ${rel}: the code it changes is missing or has changed shape (${tried.join("; ") || "no patch file"})` };
       }
-      used.push({ id: step.id, file: path.basename(chosen.file) });
+      // sha: of the patch file's bytes, so a changed patch (same id, same name) is noticed later by the engine's plan
+      used.push({ id: step.id, file: path.basename(chosen.file), sha: crypto.createHash("sha256").update(fs.readFileSync(chosen.file)).digest("hex") });
     }
     return { ok: true, content: fs.readFileSync(target), used };
   } finally {

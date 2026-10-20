@@ -1,10 +1,11 @@
-// Engine tests against a scratch tree that holds ONLY the Paperclip files the patches target (copied from the live
-// tree's pristine `.orig` backups) plus copies of the patch files. The live tree is only ever read.
-//   PAPERCLIP_TREE             live tree to copy from (default: what ~/.paperclip/cli/current resolves to)
+// Engine tests against a scratch tree that holds ONLY the Paperclip files the patches target (their ORIGINAL bytes, see
+// helpers/pristine.mjs: the .orig backup, else the unpatched file, else the engine store's copy) plus copies of the patch files.
+// The stock install is only ever read.
+//   PAPERCLIP_STOCK_TREE_1012  install to copy from (default: ~/.paperclip/cli/installs/npm/2026.1012.0); point it at an
+//                              untouched one. A target with no original makes every test below skip, with a "NO PRISTINE" reason
 //   HARDENING_LIVE_PATCHES     patch dir the live tree was patched with by apply.sh. Without it the two tests that compare the
 //                              package patches with a hand-patched install are skipped (nothing is assumed about where it lives)
 //   HARDENING_TEST_SCRATCH     where scratch trees go (default: the OS temp dir)
-// Without a live tree that has `.orig` backups the tests are skipped.
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -19,7 +20,8 @@ import { writeDurable as realWrite } from "../src/engine/store.js";
 import { normalizeSettings, writeHardeningConfig } from "../src/settings.js";
 import { evalBlock, extractBlock, withoutBlock } from "./helpers/patch-block.mjs";
 import { liveSettings } from "./helpers/live-settings.mjs";
-import { liveTreeOrNull } from "./helpers/scratch-tree.mjs";
+import { stockTreeForTests } from "./helpers/scratch-tree.mjs";
+import { noPristineSkip, pristineOrNull } from "./helpers/pristine.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ENGINE_DIR = path.resolve(HERE, "../src/engine");
@@ -31,17 +33,19 @@ const PATCH_IDS = PROTECTIONS.filter((p) => p.kind === "patch");
 const ALL = PATCH_IDS.map((p) => p.id);
 
 // ---------- fixture
-const live = liveTreeOrNull();
+const live = stockTreeForTests();
 const targets = [...new Set(fs.readdirSync(PKG_PATCHES).filter((n) => n.endsWith(".patch")).map((n) => readPatchTarget(path.join(PKG_PATCHES, n))))].sort();
-const haveLive = Boolean(live) && targets.every((rel) => fs.existsSync(path.join(live, `${rel}.orig`)));
-const skip = haveLive ? false : "no live Paperclip tree with .orig backups";
+// Targets of the patches the registry manages: a patch file the registry does not list yet (new in a release, not wired in) is not touched.
+const managedTargets = [...new Set([...discoverPatchFiles(PKG_PATCHES)].filter(([id]) => PATCHES[id]).map(([, files]) => readPatchTarget(files[0].file)))].sort();
+const skip = live ? noPristineSkip(live, targets, "1012") : "NO STOCK TREE: no Paperclip 2026.1012.0 install found; set PAPERCLIP_STOCK_TREE_1012 to an untouched install";
+const haveLive = !skip;
 
 const scratchRoot = haveLive ? fs.mkdtempSync(path.join(process.env.HARDENING_TEST_SCRATCH ?? os.tmpdir(), "engine-test-")) : null;
 const base = scratchRoot && path.join(scratchRoot, "base");
 if (haveLive) {
   for (const rel of targets) {
     fs.mkdirSync(path.dirname(path.join(base, "tree", rel)), { recursive: true });
-    fs.copyFileSync(path.join(live, `${rel}.orig`), path.join(base, "tree", rel));
+    fs.writeFileSync(path.join(base, "tree", rel), pristineOrNull(live, rel));
   }
   const pj = "node_modules/@paperclipai/server/package.json";
   fs.mkdirSync(path.dirname(path.join(base, "tree", pj)), { recursive: true });
@@ -260,17 +264,25 @@ test("a file whose code changed shape makes only that protection and its depende
     assert.match(prot["own-box"].reason, /0002 does not fit/);
     assert.equal(prot["public-web"].action, "unavailable");
     assert.match(prot["public-web"].reason, /needs "Agents can't change their own box"/);
-    for (const id of ALL.filter((x) => !["own-box", "public-web"].includes(x))) assert.equal(prot[id].action, "will-apply", `${id}: ${prot[id].reason}`);
+    // Everything that builds on it goes with it: the box for Claude agents (it needs the public-web patch), the box for OpenCode
+    // agents (it needs the Claude one) and the admission rule (it needs the own-box and Claude ones).
+    assert.equal(prot["box-claude"].action, "unavailable");
+    assert.equal(prot["box-opencode"].action, "unavailable");
+    assert.equal(prot["only-boxed"].action, "unavailable");
+    const DEPENDENTS = ["own-box", "public-web", "box-claude", "box-opencode", "only-boxed"];
+    for (const id of ALL.filter((x) => !DEPENDENTS.includes(x))) assert.equal(prot[id].action, "will-apply", `${id}: ${prot[id].reason}`);
     const r = await f.engine.apply(plan);
     assert.equal(r.ok, true);
-    assert.deepEqual(Object.keys(r.unavailable).sort(), ["own-box", "public-web"]);
+    assert.deepEqual(Object.keys(r.unavailable).sort(), DEPENDENTS.sort());
     const after = read(f.tree, rel).toString("utf8");
     assert.ok(!after.includes("LOCAL-PATCH 0002") && after.includes("LOCAL-PATCH 0009"), "0002 left out, the rest of the file patched");
-    for (const id of ["0003", "0008", "0015"]) assert.ok(!fs.readFileSync(path.join(f.tree, readPatchTarget(discoverPatchFiles(f.opts.patchesDir).get(id)[0].file)), "utf8").includes(`LOCAL-PATCH ${id}`));
+    for (const id of ["0003", "0003b", "0005f", "0008", "0015", "0017", "0025", "0026"]) assert.ok(!fs.readFileSync(path.join(f.tree, readPatchTarget(discoverPatchFiles(f.opts.patchesDir).get(id)[0].file)), "utf8").includes(`LOCAL-PATCH ${id}`));
     const st = byId((await f.engine.status({ serverStartedAt: null })).protections);
     assert.equal(st["own-box"].status, "unavailable");
     assert.equal(st["public-web"].status, "unavailable");
-    assert.equal(st["only-boxed"].status, "pending-restart");
+    assert.equal(st["box-claude"].status, "unavailable");
+    assert.equal(st["box-opencode"].status, "unavailable");
+    assert.equal(st["only-boxed"].status, "unavailable");
     // Off again restores the (changed) original exactly.
     assert.equal((await f.engine.apply(await f.engine.plan([]), { confirmCoreOff: true })).ok, true);
     assert.ok(read(f.tree, rel).equals(changedOriginal));
@@ -299,7 +311,7 @@ test("a plan is refused when a file changed after planning", { skip }, async () 
   const f = fixture();
   try {
     const plan = await f.engine.plan(["pipeline-board-only"]);
-    const rel = targets[0];
+    const rel = readPatchTarget(path.join(PKG_PATCHES, "0007-pipeline-structure-board-only.patch")); // a file of the planned protection (the first target by name need not be one)
     fs.appendFileSync(path.join(f.tree, rel), "\n// edited meanwhile\n");
     const r = await f.engine.apply(plan);
     assert.equal(r.ok, false);
@@ -363,7 +375,7 @@ test("restoreAll is byte-identical and clears state; outside changes are left al
     assert.equal((await f.engine.apply(await f.engine.plan(ALL))).ok, true);
     const r = await f.engine.restoreAll();
     assert.equal(r.ok, true);
-    assert.equal(r.restored.length, targets.length);
+    assert.equal(r.restored.length, managedTargets.length);
     assertPristine(f.tree, "after restoreAll");
     const st = await f.engine.status({ serverStartedAt: null });
     assert.deepEqual(st.enabled, []);
@@ -387,14 +399,17 @@ test("restoreAll is byte-identical and clears state; outside changes are left al
 test("taking over a tree patched by apply.sh: verified .orig, or adoptOrig when the patch files differ", { skip }, async () => {
   const f = fixture();
   try {
-    for (const rel of targets) {
+    // Targets the stock install has an apply.sh backup for are copied patched, with their .orig; the others (a file no apply.sh
+    // patch touches, such as server-utils.js) stay as they are.
+    const patchedByApplySh = targets.filter((rel) => fs.existsSync(path.join(live, `${rel}.orig`)));
+    for (const rel of patchedByApplySh) {
       fs.copyFileSync(path.join(live, rel), path.join(f.tree, rel));
       fs.copyFileSync(path.join(live, `${rel}.orig`), path.join(f.tree, `${rel}.orig`));
     }
     const plan = await f.engine.plan(ALL);
     const reproducible = plan.files.filter((x) => x.pristineSource === "orig").map((x) => x.rel);
     const differing = plan.files.filter((x) => x.blocked).map((x) => x.rel);
-    assert.equal(reproducible.length + differing.length, targets.length);
+    assert.equal(reproducible.length + differing.length, patchedByApplySh.length);
     for (const rel of differing) assert.match(plan.files.find((x) => x.rel === rel).blocked, /adopt/);
     const adopt = await f.engine.plan(ALL, { adoptOrig: true });
     for (const p of adopt.protections.filter((x) => x.kind === "patch")) assert.equal(p.action, "will-apply", `${p.id}: ${p.reason}`);

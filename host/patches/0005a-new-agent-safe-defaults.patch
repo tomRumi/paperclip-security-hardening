@@ -11,25 +11,27 @@
  import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
  import { assertClaudeOAuthBindingInvariant, claudeOAuthBindingsMatchExactly, claudeOAuthClaimRejectedError, CLAUDE_LOCAL_ADAPTER_TYPE, readClaudeOAuthBinding, secretService, } from "./secrets.js";
  import { createDbSetupTokenCleanupStore } from "./setup-token-session.js";
-@@ -40,6 +44,162 @@
+@@ -40,6 +44,216 @@
  function jsonEqual(left, right) {
      return JSON.stringify(left) === JSON.stringify(right);
  }
 +// LOCAL-PATCH 0005a: safe defaults for every NEW agent row (direct create, hire/approval materialisation, join request,
 +// built-in agents all pass through create(); a pending hire is activated through activatePendingApproval()). The
-+// defaults OVERRIDE whatever the creator supplied for these keys; later board PATCHes (updateAgent) are not touched,
++// defaults OVERRIDE whatever the creator supplied for these keys (and creator-supplied env names that redirect the box are removed); later board PATCHes (updateAgent) are not touched,
 +// so extra hosts / paths are added afterwards by the board. Edited here (server-side code), never agent-writable.
 +// Site values come from the hardening settings file, read once at startup (written by the Security hardening plugin, never
 +// agent-writable; ignored unless it passes the location and ownership checks below): $PAPERCLIP_HARDENING_CONFIG, else
 +// <instance root>/hardening/config.json. Keys, and the default without one:
 +//   baseAllowlist        claude_local network allowlist (the model API host only; the Paperclip API is always reachable)
-+//   extraReadOnlyPaths   claude_local extra read-only paths (none)
++//   baseAllowlists       the same for the other scoped local types, { <adapter type>: [hosts] }; a type without an entry gets the
++//                        default of NEW_AGENT_BOX_PROFILES below (the model provider's own API hosts)
++//   extraReadOnlyPaths   extra read-only paths of every scoped local type (none)
 +//   hermesWrapperPath    hermes_local command (/usr/local/bin/hermes-sandbox)
 +//   hermesAllowlist      hermes_local HERMES_SANDBOX_ALLOW (the model API host only)
 +//   hermesReadOnlyPaths  hermes_local HERMES_SANDBOX_RO (unset: the wrapper keeps its own Hermes install dirs)
 +// The settings file is trusted for allowlists and read-only paths, so it is used only when no agent run can have written it.
 +// Its real path must not lie inside <instance root>/workspaces, /projects or /companies (the adapters bind the workspace and
-+// companies/<company>/agents/<agent>/claude-runtime and codex-home read-write) nor inside a workspace root (the roots below,
++// companies/<company>/agents/<agent>/<adapter>-runtime and codex-home read-write) nor inside a workspace root (the roots below,
 +// from the file itself or $PAPERCLIP_SANDBOX_WORKSPACE_ROOT: whatever a run may use as its writable workspace). The file must
 +// be a regular file owned by the user this server runs as with mode 0600, and its directory owned by that user and not
 +// group- or world-writable. Otherwise the file is ignored: the secure built-in defaults stay in force. The path is
@@ -125,6 +127,25 @@
 +const safeSettingList = (value, absolute = false) => Array.isArray(value)
 +    ? value.filter((s) => typeof s === "string" && s.trim() && (!absolute || s.trim().startsWith("/"))).map((s) => s.trim())
 +    : null;
++// Per adapter type boxed through filesystemScope/networkScope (bubblewrap run by Paperclip itself): every NEW agent of the type
++// starts with these scopes, /usr/bin/bwrap and its network allowlist. engineCli: the type's default engine (unset / "auto") is an
++// ACP lane the box cannot reach, so the agent is stored with engine "cli". hosts: allowlist without a settings entry (a drift
++// test compares this table with BOX_PROFILES of the Security hardening plugin, src/profiles.js). hermes_local is boxed by the
++// root-owned wrapper instead (below); remote and gateway types are not touched here (0005b refuses them unless excepted).
++const NEW_AGENT_BOX_PROFILES = {
++    claude_local: { engineCli: true, hosts: ["api.anthropic.com"] },
++    codex_local: { engineCli: true, hosts: ["api.openai.com"] },
++    opencode_local: { engineCli: false, hosts: ["openrouter.ai", "api.anthropic.com", "api.openai.com", "generativelanguage.googleapis.com"] },
++    gemini_local: { engineCli: true, hosts: ["generativelanguage.googleapis.com"] },
++    cursor: { engineCli: false, hosts: ["api2.cursor.sh"] },
++    pi_local: { engineCli: false, hosts: [] },
++    kimi_local: { engineCli: true, hosts: ["api.moonshot.ai"] },
++    grok_local: { engineCli: false, hosts: ["api.x.ai"] },
++};
++const safeBaseAllowlists = isPlainRecord(SAFE_SETTINGS.baseAllowlists) ? SAFE_SETTINGS.baseAllowlists : {};
++// claude_local keeps its own key (baseAllowlist, as before baseAllowlists existed).
++const boxAllowlist = (type) => (type === "claude_local" ? safeSettingList(SAFE_SETTINGS.baseAllowlist) : Object.hasOwn(safeBaseAllowlists, type) ? safeSettingList(safeBaseAllowlists[type]) : null)
++    ?? [...NEW_AGENT_BOX_PROFILES[type].hosts];
 +const NEW_AGENT_SAFE_DEFAULTS = {
 +    canCreateAgents: false,
 +    filesystemScope: "workspace",
@@ -139,28 +160,61 @@
 +    // hermes-sandbox replaces its default read-only set (Hermes install) when this is set; null keeps the wrapper's own.
 +    hermesSandboxRo: safeSettingList(SAFE_SETTINGS.hermesReadOnlyPaths, true)?.join(",") ?? null,
 +};
++// Environment names a creator may not store on a boxed agent. The spawn-time enforcement (patch 0003) lets a run value through
++// when it equals the STORED plain value, so whatever is stored at creation stays trusted for every later run: a creator-supplied
++// CODEX_HOME=~/.codex, HERMES_SANDBOX_PASS=DATABASE_URL or HERMES_SANDBOX_HOME would be honoured forever. Every name the enforcement
++// (sandboxEnvDropReason and the 0003b redirect rule in heartbeat.js; a test compares the two over a list of names) would drop from a
++// run is removed here, credentials (API keys, tokens, secret references under any other name) are kept. The board can still set such
++// a value later with a PATCH; that is a deliberate act of the board.
++const NEW_AGENT_SYSTEM_PATH_DIRS = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/snap"];
++const NEW_AGENT_STATE_ENV = new Set(["HOME", "HERMES_HOME", "GEMINI_CLI_HOME", "PI_CODING_AGENT_DIR", "KIMI_CODE_HOME", "CURSOR_HOME", "CURSOR_DATA_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME"]);
++function newAgentEnvIsUnsafe(key, binding) {
++    if (/SANDBOX/i.test(key) || /^BWRAP/i.test(key) || /^(LD_|DYLD_)/.test(key) || key === "GLIBC_TUNABLES")
++        return true;
++    if (key === "NODE_OPTIONS" || key === "NODE_PATH" || key === "BASH_ENV" || key === "ENV" || /^(https?|all|no)_proxy$/i.test(key))
++        return true;
++    if (key === "PATH") {
++        const value = typeof binding === "string" ? binding : isPlainRecord(binding) && binding.type === "plain" ? binding.value : null;
++        return !(typeof value === "string" && value.split(":").every((entry) => hardeningPath.isAbsolute(entry) && NEW_AGENT_SYSTEM_PATH_DIRS.some((dir) => hardeningPath.resolve(entry) === dir || hardeningPath.resolve(entry).startsWith(`${dir}/`))));
++    }
++    return NEW_AGENT_STATE_ENV.has(key) || /^XDG_/.test(key) || (/^OPENCODE_/.test(key) && key !== "OPENCODE_AUTH_JSON") ||
++        /^PAPERCLIP_[A-Z0-9_]+_PROVIDERS$/.test(key) || key === "PAPERCLIP_API_URL" || /^PAPERCLIP_RUNTIME_TOOLS_/.test(key);
++}
++function withoutUnsafeEnv(config, dropped) {
++    if (!isPlainRecord(config.env))
++        return config;
++    const env = {};
++    for (const [key, binding] of Object.entries(config.env)) {
++        if (newAgentEnvIsUnsafe(key, binding))
++            dropped.push(key);
++        else
++            env[key] = binding;
++    }
++    return { ...config, env };
++}
 +function applyNewAgentSafeDefaults(adapterType, adapterConfig, permissions, source) {
 +    const nextPermissions = { ...(isPlainRecord(permissions) ? permissions : {}), canCreateAgents: NEW_AGENT_SAFE_DEFAULTS.canCreateAgents, canCreateSkills: false };
 +    let nextConfig = isPlainRecord(adapterConfig) ? { ...adapterConfig } : {};
-+    if (adapterType === "claude_local") {
-+        // engine: the adapter's default (unset, "auto" or any unknown value) is ACP, which it refuses to run under a filesystem or
-+        // network scope ("requires the Claude CLI engine"), so a new boxed agent would fail at its first run. Unset / "auto" / unknown
-+        // becomes "cli". An explicit "cli" or "acp" is the creator's choice and is kept (explicit "acp" stays refused at run time, which
-+        // is safe: the run fails, it does not run unboxed).
-+        const requestedEngine = typeof nextConfig.engine === "string" ? nextConfig.engine.trim().toLowerCase() : "";
++    const droppedEnv = [];
++    if (Object.hasOwn(NEW_AGENT_BOX_PROFILES, adapterType)) {
++        // engine (types with engineCli): the adapter's default (unset, "auto" or any unknown value) is ACP, which it refuses to run
++        // under a filesystem or network scope ("requires the ... CLI engine"), so a new boxed agent would fail at its first run, and an
++        // explicit "acp" is a lane the box never sees. These types are always stored with engine "cli", whatever the creator sent (the
++        // spawn-time admission and enforcement trust the STORED engine). Types without engineCli get no engine key of ours.
 +        nextConfig = {
 +            ...nextConfig,
-+            engine: requestedEngine === "acp" || requestedEngine === "cli" ? nextConfig.engine : "cli",
++            ...(NEW_AGENT_BOX_PROFILES[adapterType].engineCli ? { engine: "cli" } : {}),
 +            filesystemScope: NEW_AGENT_SAFE_DEFAULTS.filesystemScope,
 +            filesystemSandboxCommand: NEW_AGENT_SAFE_DEFAULTS.filesystemSandboxCommand,
 +            filesystemExtraPaths: [...NEW_AGENT_SAFE_DEFAULTS.filesystemExtraPaths],
 +            networkScope: NEW_AGENT_SAFE_DEFAULTS.networkScope,
-+            networkAllowlist: [...NEW_AGENT_SAFE_DEFAULTS.networkAllowlist],
++            networkAllowlist: boxAllowlist(adapterType),
 +        };
++        nextConfig = withoutUnsafeEnv(nextConfig, droppedEnv);
 +    }
 +    else if (adapterType === "hermes_local") {
 +        // env values are stored as { type: "plain", value } bindings (a bare string is also accepted by the resolver).
-+        const env = isPlainRecord(nextConfig.env) ? { ...nextConfig.env } : {};
++        const env = isPlainRecord(nextConfig.env) ? withoutUnsafeEnv(nextConfig, droppedEnv).env : {};
 +        env.HERMES_SANDBOX_ALLOW = { type: "plain", value: NEW_AGENT_SAFE_DEFAULTS.hermesSandboxAllow };
 +        if (NEW_AGENT_SAFE_DEFAULTS.hermesSandboxRo === null)
 +            delete env.HERMES_SANDBOX_RO;
@@ -168,13 +222,13 @@
 +            env.HERMES_SANDBOX_RO = { type: "plain", value: NEW_AGENT_SAFE_DEFAULTS.hermesSandboxRo };
 +        nextConfig = { ...nextConfig, command: NEW_AGENT_SAFE_DEFAULTS.hermesCommand, env };
 +    }
-+    logger.warn({ event: "new_agent_defaults", adapterType, source }, "new agent: sandbox and permission defaults applied (creator-supplied values for these keys are ignored)");
++    logger.warn({ event: "new_agent_defaults", adapterType, source, ...(droppedEnv.length ? { droppedEnv } : {}) }, "new agent: sandbox and permission defaults applied (creator-supplied values for these keys are ignored)");
 +    return { adapterConfig: nextConfig, permissions: nextPermissions };
 +}
  function buildConfigSnapshot(row) {
      const adapterConfig = typeof row.adapterConfig === "object" && row.adapterConfig !== null && !Array.isArray(row.adapterConfig)
          ? sanitizeRecord(row.adapterConfig)
-@@ -675,6 +835,8 @@
+@@ -675,6 +889,8 @@
                  nextConfig: adapterConfig,
                  priorConfig: null,
              });
@@ -183,7 +237,7 @@
              return db.transaction(async (tx) => {
                  const txDb = tx;
                  // Consume the stored-session claim and create the fixed definition inside
-@@ -697,8 +859,8 @@
+@@ -697,8 +913,8 @@
                      companyId,
                      role,
                      adapterType,
@@ -194,7 +248,7 @@
                      runtimeConfig,
                  })
                      .returning()
-@@ -883,6 +1045,13 @@
+@@ -883,6 +1099,13 @@
                      // request, so the new-agent creation default applies.
                      patch.permissions = normalizeAgentPermissions(patch.permissions, { context: "create" });
                  }

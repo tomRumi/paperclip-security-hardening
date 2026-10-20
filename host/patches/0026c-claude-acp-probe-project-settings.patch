@@ -1,0 +1,78 @@
+--- a/node_modules/@paperclipai/adapter-claude-local/dist/server/acp.js
++++ b/node_modules/@paperclipai/adapter-claude-local/dist/server/acp.js
+@@ -1,4 +1,5 @@
+ import fs from "node:fs/promises";
++import os from "node:os"; // LOCAL-PATCH 0026c
+ import path from "node:path";
+ import { fileURLToPath } from "node:url";
+ import { parseLocalProcessFilesystemScope, parseLocalProcessNetworkScope, } from "@paperclipai/adapter-utils/local-process-sandbox";
+@@ -526,11 +527,20 @@
+         env = built.env;
+         cwd = asString(config.cwd, process.cwd());
+     }
++    // LOCAL-PATCH 0026c: the login probe of a local target runs the trusted server `claude` as the service user, outside any agent box, and
++    // must not load anything an agent can write: only the user settings (see below), never the CLAUDE_CONFIG_DIR of the request.
++    const probeIsLocal = !targetIsRemote;
++    if (probeIsLocal && "CLAUDE_CONFIG_DIR" in env && !(config.managedAiConnection && await isManagedAiClaudeConfigDir0026c(env.CLAUDE_CONFIG_DIR, input.companyId)))
++        delete env.CLAUDE_CONFIG_DIR;
+     Object.assign(env, claudeSandboxPermissionEnv({
+         dangerouslySkipPermissions: asBoolean(config.dangerouslySkipPermissions, true), targetIsSandbox,
+     }));
++    // LOCAL-PATCH 0026c: "claude --print" runs the hooks of the project settings (.claude/settings.json, settings.local.json) found in its working
++    // directory, and an agent writes its workspace; the request alone decides which config is tested, so the probe cannot depend on it to tell a
++    // boxed agent from an unboxed one. A local probe is not run in the box (it also runs before an agent exists, so it has no agent runtime dir to
++    // mount); it always loads the user settings only (--setting-sources user) and runs in an empty private directory, never in the agent's.
+     const args = ["--print", "-", "--output-format", "stream-json", "--verbose"];
+-    if (config.managedAiConnection)
++    if (config.managedAiConnection || probeIsLocal)
+         args.push("--setting-sources", "user");
+     args.push(...buildClaudeProbePermissionArgs({
+         dangerouslySkipPermissions: asBoolean(config.dangerouslySkipPermissions, true),
+@@ -540,6 +550,8 @@
+     const timeoutSec = Math.max(1, asNumber(config.helloProbeTimeoutSec, targetIsSandbox ? 90 : 45));
+     const runId = `claude-acp-authprobe-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+     let probe;
++    if (probeIsLocal)
++        cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-probe-")); // LOCAL-PATCH 0026c
+     try {
+         probe = await runAdapterExecutionTargetProcess(runId, target, command, args, {
+             cwd,
+@@ -548,7 +560,7 @@
+             graceSec: 5,
+             stdin: "Respond with hello.",
+             onLog: async () => { },
+-        });
++        }).finally(() => (probeIsLocal ? fs.rm(cwd, { recursive: true, force: true }) : undefined)); // LOCAL-PATCH 0026c
+     }
+     catch (err) {
+         // Keep the raw error out of the Test-result check and the server log. Log
+@@ -586,6 +598,20 @@
+     }
+     return [];
+ }
++// LOCAL-PATCH 0026c: the CLAUDE_CONFIG_DIR of a Test request is kept only when it is the credential home the server itself made for a managed
++// AI connection of this company (<tmp>/paperclip-ai-<company>-<grant>-*/provider). Any other value is the caller's: for a boxed agent it is a
++// folder inside its own box, which the agent writes, and Claude loads the hooks of the settings.json found there. The probe then falls back to
++// the server's own environment (its own CLAUDE_CONFIG_DIR or home directory).
++async function isManagedAiClaudeConfigDir0026c(dir, companyId) {
++    if (typeof dir !== "string" || dir.trim() === "" || !/^[A-Za-z0-9_-]{1,128}$/.test(String(companyId ?? "")))
++        return false;
++    const real = await fs.realpath(dir).catch(() => "");
++    const tmp = await fs.realpath(os.tmpdir()).catch(() => os.tmpdir());
++    if (!real || path.basename(real) !== "provider")
++        return false;
++    const home = path.dirname(real);
++    return path.dirname(home) === tmp && path.basename(home).startsWith(`paperclip-ai-${companyId}-`);
++}
+ export async function testClaudeAcpEnvironment(ctx) {
+     const checks = [];
+     const config = parseObject(ctx.config);
+@@ -769,7 +795,7 @@
+         })));
+         const canProbe = !checks.some((check) => check.code === "claude_managed_config_dir_failed");
+         if (canProbe) {
+-            checks.push(...(await probeClaudeAcpSandboxLogin({ config, target, env: probeEnv })));
++            checks.push(...(await probeClaudeAcpSandboxLogin({ config, target, env: probeEnv, companyId: ctx.companyId })));
+         }
+     }
+     const mode = firstNonEmptyString(config.mode, config.acpMode) ?? DEFAULT_ACP_ENGINE_MODE;

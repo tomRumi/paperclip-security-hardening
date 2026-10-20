@@ -1,0 +1,87 @@
+--- a/node_modules/@paperclipai/server/dist/services/heartbeat.js
++++ b/node_modules/@paperclipai/server/dist/services/heartbeat.js
+@@ -1027,28 +1027,72 @@
+     };
+ }
+ const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
+-// LOCAL-PATCH 0005b: fail closed. A local run only starts for an agent whose STORED config is sandboxed. Only the
+-// claude_local adapter implements filesystemScope; hermes_local is sandboxed by its launcher script;
+-// every other adapter type has no sandbox implementation here, so it is refused.
++// LOCAL-PATCH 0005f: table-driven admission (replaces the claude_local / hermes_local rule of 0005b). A local run starts only
++// when the agent's STORED config and this installation together put it in the box. Scoped types (the table below; it equals
++// BOX_PROFILES of the Security hardening plugin, a test compares them) need ALL of: filesystemScope "workspace", a networkScope
++// ("deny" or "allowlist"), engine "cli" for the types whose default engine is an ACP lane the box cannot reach, the adapter
++// registered as boxed in this process (registerBoxedAdapter of patch 0017, called when the adapter loads) and the environment
++// scrub of patch 0025 (without it a boxed child inherits the server's environment). hermes_local is boxed by the root-owned
++// wrapper: the adapter runs hermesCommand || command, so BOTH must be the wrapper. The remote, gateway and generic process types
++// are refused unless an administrator listed this agent id and type under remoteExceptions in the hardening settings file; that
++// file is read again, with the trust checks of patch 0003, each time such an agent is about to run, so an edit applies without a
++// restart, and an untrusted or unreadable file means no exceptions. Every run admitted that way is logged. Any other type
++// (paperclip_runner, acpx_local, adapter plugins, unknown) is always refused.
++const SANDBOX_ADMISSION_0005F = {
++    claude_local: { engineCli: true },
++    codex_local: { engineCli: true },
++    opencode_local: { engineCli: false },
++    gemini_local: { engineCli: true },
++    cursor: { engineCli: false },
++    pi_local: { engineCli: false },
++    kimi_local: { engineCli: true },
++    grok_local: { engineCli: false },
++};
++const SANDBOX_EXCEPTIONABLE_TYPES_0005F = ["cursor_cloud", "openclaw_gateway", "hermes_gateway", "http", "process"];
++function sandboxHasRemoteException0005f(agentId, adapterType) {
++    const list = readHardeningConfig0003().remoteExceptions;
++    return Array.isArray(list) && list.some((entry) => entry !== null && typeof entry === "object" && !Array.isArray(entry) && entry.agentId === agentId && entry.type === adapterType);
++}
+ function refuseUnsandboxedLocalAgent(input) {
+     const stored = parseObject(input.agent.adapterConfig);
+     const adapterType = input.agent.adapterType;
+-    let refusal = null;
+-    if (adapterType === "claude_local") {
+-        if (!stored.filesystemScope)
+-            refusal = `${adapterType} agent has no filesystemScope in its stored adapterConfig`;
++    const missing = [];
++    let hint = "Agents must run sandboxed; the board must set the sandbox config (PATCH /agents/:id adapterConfig) before this agent can run.";
++    if (typeof adapterType === "string" && Object.hasOwn(SANDBOX_ADMISSION_0005F, adapterType)) {
++        if (stored.filesystemScope !== "workspace")
++            missing.push(`${adapterType} agent has no filesystemScope "workspace" in its stored adapterConfig`);
++        if (stored.networkScope !== "deny" && stored.networkScope !== "allowlist")
++            missing.push(`${adapterType} agent has no networkScope ("deny" or "allowlist") in its stored adapterConfig`);
++        if (SANDBOX_ADMISSION_0005F[adapterType].engineCli && stored.engine !== "cli")
++            missing.push(`${adapterType} agent has no engine "cli" in its stored adapterConfig (its default engine is not sandboxed)`);
++        const registered = globalThis[Symbol.for("paperclip.hardening.boxedAdapters")];
++        if (typeof registered?.has !== "function" || registered.has(adapterType) !== true)
++            missing.push(`the ${adapterType} adapter is not registered as boxed in this server (the sandbox patch for it is not applied)`);
++        if (globalThis[Symbol.for("paperclip.hardening.envScrub")] !== true)
++            missing.push("the sandbox environment scrub (patch 0025) is not loaded, so a sandboxed child would inherit the server environment");
+     }
+     else if (adapterType === "hermes_local") {
+-        if (stored.command !== "/usr/local/bin/hermes-sandbox")
+-            refusal = "hermes_local agent command is not /usr/local/bin/hermes-sandbox";
++        if (stored.command !== SANDBOX_HERMES_WRAPPER_0003B)
++            missing.push(`hermes_local agent command is not ${SANDBOX_HERMES_WRAPPER_0003B}`);
++        if (stored.hermesCommand != null && stored.hermesCommand !== "" && stored.hermesCommand !== SANDBOX_HERMES_WRAPPER_0003B)
++            missing.push(`hermes_local agent hermesCommand is not ${SANDBOX_HERMES_WRAPPER_0003B} (the adapter runs hermesCommand before command)`);
++    }
++    else if (typeof adapterType === "string" && SANDBOX_EXCEPTIONABLE_TYPES_0005F.includes(adapterType)) {
++        if (sandboxHasRemoteException0005f(input.agent.id, adapterType)) {
++            logger.warn({ event: "sandbox_remote_exception_used", agentId: input.agent.id, runId: input.runId, type: adapterType }, `sandbox enforcement: ${adapterType} agent runs outside the box under a remote exception`);
++            return;
++        }
++        missing.push(`${adapterType} agents run outside the box and this agent has no remote exception in the hardening settings file`);
++        hint = "An administrator can exempt this agent under remote exceptions in the Security hardening settings.";
+     }
+     else {
+-        refusal = `adapter type "${adapterType}" has no sandbox implementation`;
++        missing.push(`adapter type "${adapterType}" has no sandbox implementation and cannot be excepted`);
+     }
+-    if (!refusal)
++    if (missing.length === 0)
+         return;
++    const refusal = missing.join("; ");
+     logger.warn({ event: "sandbox_enforcement", action: "refuse_unsandboxed", agentId: input.agent.id, runId: input.runId, adapterType }, `sandbox enforcement: refused run, ${refusal}`);
+-    throw new Error(`Sandbox policy: run refused, ${refusal}. Agents must run sandboxed; the board must set the sandbox config (PATCH /agents/:id adapterConfig) before this agent can run.`);
++    throw new Error(`Sandbox policy: run refused, ${refusal}. ${hint}`);
+ }
+ function formatMissingBindingForOperator(missing) {
+     if (missing.bindingType === "user_secret_ref") {

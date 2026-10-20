@@ -1,0 +1,74 @@
+--- a/node_modules/@paperclipai/adapter-utils/dist/server-utils.js
++++ b/node_modules/@paperclipai/adapter-utils/dist/server-utils.js
+@@ -3076,6 +3076,57 @@
+     }
+     throw new Error(`Command not found in PATH: "${command}"`);
+ }
++// LOCAL-PATCH 0025: a confined (bwrap) child gets an explicit allowlist of environment variables, never the server's.
++// Adapters build opts.env as { ...process.env, ...env }, so the sandbox builder cannot tell server secrets (database URL,
++// JWT/API keys, NODE_OPTIONS, ...) from the agent's own credentials. The adapter lists the names of ITS OWN env object (never
++// process.env) in localProcessSandbox.envPassNames (boxedSandboxOptions of patch 0017 does: resolved config.env secrets and every
++// PAPERCLIP_ run variable the adapter assigned, such as PAPERCLIP_RUN_ID, PAPERCLIP_AGENT_ID, PAPERCLIP_API_URL,
++// PAPERCLIP_API_KEY, PAPERCLIP_TASK_ID, PAPERCLIP_WAKE_*, PAPERCLIP_RUNTIME_*). Child env = BASE + the listed names with their
++// values from opts.env; nothing else, and a missing or malformed envPassNames list passes BASE only (fail closed).
++//   - HOME is always set by the scrub itself: the box home (localProcessSandbox.homeDir) when the box has one, else the server's
++//     own HOME (a network-only box has no box home), never a value from the adapter's env, so an env HOME cannot move the child's
++//     home or its state. The other BASE names (PATH, LANG, LC_*, TZ, TERM, the proxy names) take their value from opts.env
++//     ({ ...process.env, ...adapter env }; the box's network proxy sets its own proxy variables afterwards). Listing a BASE name in
++//     envPassNames changes nothing.
++//   - a PAPERCLIP_ name is passed only when it is listed AND its value differs from the server's own value of that name, so a
++//     server variable inherited unchanged into opts.env stays out even if a careless adapter lists it. PAPERCLIP_API_URL is the one
++//     exception: it is a plain URL, and the server often sets it itself.
++//   - never passed, even when listed: variables that make the child (or the proxy bridge started in the box) load code of the
++//     caller's choosing, and PAPERCLIP_ names that look like a secret, private key or master key.
++// BASE_ENV_ALLOW is a copy of the list exported by LOCAL-PATCH 0017 (a test compares them).
++const BASE_ENV_ALLOW = Object.freeze([
++    "PATH", "HOME", "LANG", "LANGUAGE", "TZ", "TERM",
++    "LC_ALL", "LC_CTYPE", "LC_COLLATE", "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME", "LC_PAPER", "LC_NAME",
++    "LC_ADDRESS", "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION",
++    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "no_proxy",
++]);
++const NEVER_PASS_ENV = [/^NODE_OPTIONS$/, /^NODE_PATH$/, /^LD_/, /^DYLD_/, /^GLIBC_TUNABLES$/, /^BASH_ENV$/, /^ENV$/, /^PYTHON/, /^PAPERCLIP_.*(SECRET|PRIVATE_KEY|MASTER_KEY)/];
++const PAPERCLIP_NAMES_THAT_MAY_EQUAL_THE_SERVER_VALUE = new Set(["PAPERCLIP_API_URL"]);
++// Announced for the spawn-time check (0005f). Not writable or configurable, so nothing in the process can switch it off or fake it.
++if (!Object.getOwnPropertyDescriptor(globalThis, Symbol.for("paperclip.hardening.envScrub"))) {
++    Object.defineProperty(globalThis, Symbol.for("paperclip.hardening.envScrub"), { value: true, writable: false, configurable: false, enumerable: false });
++}
++function scrubConfinedChildEnv(merged, adapterEnv, passNames, boxHome) {
++    const never = (key) => NEVER_PASS_ENV.some((re) => re.test(key));
++    const scrubbed = {};
++    for (const key of BASE_ENV_ALLOW) {
++        if (key !== "HOME" && typeof merged[key] === "string" && !never(key))
++            scrubbed[key] = merged[key];
++    }
++    const home = typeof boxHome === "string" && boxHome.length > 0 ? boxHome : process.env.HOME;
++    if (typeof home === "string" && home.length > 0)
++        scrubbed.HOME = home;
++    const passes = new Set(Array.isArray(passNames) ? passNames.filter((name) => typeof name === "string") : []);
++    for (const key of passes) {
++        const value = adapterEnv?.[key];
++        if (typeof value !== "string" || BASE_ENV_ALLOW.includes(key) || never(key))
++            continue;
++        if (key.startsWith("PAPERCLIP_") && value === process.env[key] && !PAPERCLIP_NAMES_THAT_MAY_EQUAL_THE_SERVER_VALUE.has(key))
++            continue;
++        scrubbed[key] = value;
++    }
++    return scrubbed;
++}
+ export async function runChildProcess(runId, command, args, opts) {
+     const onLogError = opts.onLogError ??
+         ((err, id, msg) => console.warn({ err, runId: id }, msg));
+@@ -3102,6 +3153,13 @@
+         if (opts.localProcessSandbox?.homeDir) {
+             mergedEnv.HOME = opts.localProcessSandbox.homeDir;
+         }
++        if (opts.localProcessSandbox && !opts.remoteExecution) {
++            // LOCAL-PATCH 0025: confined child, scrubbed env (see scrubConfinedChildEnv).
++            const scrubbed = scrubConfinedChildEnv(mergedEnv, opts.env, opts.localProcessSandbox.envPassNames, opts.localProcessSandbox.homeDir);
++            for (const key of Object.keys(mergedEnv))
++                delete mergedEnv[key];
++            Object.assign(mergedEnv, scrubbed);
++        }
+         void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
+             remoteExecution: opts.remoteExecution ?? null,
+             remoteEnv: opts.remoteExecution ? opts.env : null,

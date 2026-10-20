@@ -15,8 +15,8 @@ test.after(() => { if (!skip) S.cleanup(); });
 const actor = (type, userId, companyId = "c1") => ({ actor: Object.freeze({ type, userId, agentId: type === "agent" ? "a1" : null, runId: null, companyId }), companyId });
 const ADMIN = actor("user", "u-admin");
 const AGENT = actor("agent", null);
-const DEFAULTS = ["sandbox-compat", "own-box", "only-boxed", "safe-defaults", "no-permission-handing", "pipeline-board-only", "assign-needs-grant", "public-web", "own-claude-folder"];
-const FUNCTIONAL = ["sandbox-compat", "own-box", "safe-defaults", "public-web"];
+const DEFAULTS = ["sandbox-compat", "own-box", "only-boxed", "safe-defaults", "no-permission-handing", "pipeline-board-only", "assign-needs-grant", "public-web", "own-claude-folder", "box-claude", "box-opencode"];
+const FUNCTIONAL = ["sandbox-compat", "own-box", "safe-defaults", "public-web", "box-claude", "box-opencode", "only-boxed"];
 const usrMerged = (() => { try { return fs.lstatSync("/bin").isSymbolicLink(); } catch { return false; } })();
 
 function fakeCtx({ alertCompanyId = "c1", issuesFail = false } = {}) {
@@ -47,7 +47,7 @@ test("functional checks fail on Paperclip's original files (they test behaviour,
   } finally { f.cleanup(); }
 });
 
-test("after a restart every applied protection passes; four are functional, the rest structural only", { skip }, async () => {
+test("after a restart every applied protection passes; six are functional, the rest structural only", { skip }, async () => {
   const f = S.fresh();
   try {
     const fk = fakeCtx();
@@ -84,12 +84,15 @@ test("after a restart every applied protection passes; four are functional, the 
     assert.equal(rows["pipeline-board-only"].selfTest.mode, "structural only");
     assert.equal(st.selfTest.waitingRestart, false);
 
-    // A later change of the protection's files invalidates the stored result (status no longer claims a pass).
-    assert.equal((await h.applyChange({ enabled: DEFAULTS.filter((id) => id !== "public-web") }, ADMIN)).ok, true);
+    // A later change of the protection's files invalidates the stored result (status no longer claims a pass). Switching the
+    // public-web box off also switches off what is built on it (the box for Claude and OpenCode agents, and the admission rule).
+    assert.equal((await h.applyChange({ enabled: DEFAULTS.filter((id) => id !== "public-web"), confirmCoreOff: true }, ADMIN)).ok, true);
     started = new Date(Date.now() + 120000).toISOString();
     const rows2 = byId((await h.getStatus()).protections);
     assert.equal(rows2["sandbox-compat"].selfTest, null, "local-process-sandbox.js was rebuilt");
-    assert.equal(rows2["own-box"].selfTest.ok, true, "own-box's files are unchanged");
+    assert.equal(rows2["own-box"].selfTest, null, "heartbeat.js was rebuilt without the admission rule");
+    assert.equal(rows2["no-permission-handing"].selfTest, null, "routes/agents.js was rebuilt without the board-only test route (only boxed agents run)");
+    assert.equal(rows2["pipeline-board-only"].selfTest.ok, true, "its files are unchanged");
   } finally { f.cleanup(); }
 });
 

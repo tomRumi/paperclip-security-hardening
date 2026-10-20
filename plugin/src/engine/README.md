@@ -37,7 +37,12 @@ await engine.restoreAll({ force });                                     // put e
   every target file is trial-built: pristine, then the patches of every switched-on protection that touches the file,
   in global patch-id order. Each protection gets an `action`: `will-apply`, `will-remove`, `unchanged`, or
   `unavailable` (with `reason`). Each file gets `pristineSource`, `builtSha`, `currentSha` and `change`.
-  `confirmationNeeded` lists the core protections being switched off, with their `risk`.
+  An applied protection is `unchanged` only when its files equal the last build AND its patches in the planned build are the
+  recorded ones (same list, same patch file bytes: `files[rel].patches` and `patchShas`). A release that adds a patch to a
+  protection, or reworks a patch file, therefore shows `will-apply` for that protection only, and only it is marked as
+  waiting for the restart. A state written before `patchShas` existed has no hash to compare: any planned change of the file
+  counts for the protections on it.
+  `confirmationNeeded` lists the core protections being switched off, with their `risk`, and the core protections that are applied now but no longer fit this Paperclip (`unavailable: true`, with the `reason`): rebuilding would drop them, which counts as switching them off.
   - `repair`: a built file edited outside the engine is rebuilt from its stored original. Without it, that file is
     left alone and its protections are unavailable.
   - `adoptOrig`: takes over files patched by `apply.sh` with different patch files, using the `.orig` next to each one.
@@ -157,7 +162,7 @@ never blocks anything. When no candidate fits, the protection is `unavailable on
 ## Data dir
 
 ```
-<dataDir>/state.json      {enabled, applied, unavailable, files: {rel: {pristineSha, builtSha, patches}}, appliedAt,
+<dataDir>/state.json      {enabled, applied, unavailable, files: {rel: {pristineSha, builtSha, patches, patchShas}}, appliedAt,
                            changedAt, pending, restartPending, tree, paperclipVersion}
 <dataDir>/pristine/<rel>  byte-exact originals (rel = path inside the Paperclip tree), mode 0600
 <dataDir>/events.jsonl    pristine-stored / pristine-refreshed / tree-changed / applied / apply-failed / restored

@@ -27,6 +27,10 @@ export const CONFIG_STATE_KEY = Object.freeze({ scopeKind: "instance", stateKey:
 export const SELFTEST_KEY = Object.freeze({ scopeKind: "instance", stateKey: "selftest" });
 /** Last "target unknown" alert raised: {code} (cleared once the target resolves again). */
 export const TARGET_ALERT_KEY = Object.freeze({ scopeKind: "instance", stateKey: "target-alert" });
+/** Set while a Paperclip update (or a new patch set) left a switched-on core protection that no longer fits and the plugin therefore
+ *  rebuilt nothing: {at, paperclipVersion, signature, alerted, protections: [{id, title, risk, reason}]}. Cleared by the next start that
+ *  can apply everything, or by an admin's Save (which asks for the confirmation). */
+export const UPDATE_DECISION_KEY = Object.freeze({ scopeKind: "instance", stateKey: "update-decision" });
 const PLACEHOLDER_NOTE = "coming in a later step";
 /** Protections whose patched code reads the settings file (a settings change needs a restart while they are on). */
 const READS_CONFIG = ["own-box", "safe-defaults"];
@@ -217,7 +221,7 @@ export function createHardening({ ctx, engineOptions = {}, resolveTargetFn = res
       await ctx.state.set(SELFTEST_KEY, { ...(prev ?? {}), at, trigger, waitingRestart: true, results: {} });
       return { ok: true, ran: false, reason: "Paperclip has not restarted since the last change; the self-test runs after the restart" };
     }
-    const r = await runSelfTestFn({ engine, status, instanceRoot: target.instanceRoot, env: { PAPERCLIP_HARDENING_CONFIG: target.configPath, ...(target.sandboxRootsEnv ? { PAPERCLIP_SANDBOX_WORKSPACE_ROOT: target.sandboxRootsEnv } : {}) } });
+    const r = await runSelfTestFn({ engine, status, instanceRoot: target.instanceRoot, userHome: target.userHome, env: { PAPERCLIP_HARDENING_CONFIG: target.configPath, ...(target.sandboxRootsEnv ? { PAPERCLIP_SANDBOX_WORKSPACE_ROOT: target.sandboxRootsEnv } : {}) } });
     const failed = Object.entries(r.results).filter(([, x]) => !x.ok).map(([id]) => id).sort();
     const signature = failed.join(",");
     let alertedSignature = prev?.alertedSignature ?? "";
@@ -250,6 +254,36 @@ export function createHardening({ ctx, engineOptions = {}, resolveTargetFn = res
       description: `On start the plugin could not work out which Paperclip install it belongs to, so it changed nothing and will not re-apply the protections (for example after a Paperclip update):\n\n${err.message}\n\nOpen the Hardening page for the details. Apply or restore with the command-line tool (plugin/bin/hardening-engine.mjs, see its README) until this is resolved.` });
     if (a.ok) await ctx.state.set(TARGET_ALERT_KEY, { code: err.targetCode }).catch(() => {});
   }
+
+  /**
+   * A switched-on core protection that is applied now no longer fits the Paperclip files (an update changed the code its patches
+   * change): rebuilding would drop it silently. That is treated like switching it off, which needs the owner's confirmation, so the
+   * automatic re-apply stops here: nothing is rebuilt, a HIGH alert is raised (once per set of protections and Paperclip version) and the
+   * Hardening page shows "update needs admin decision". The admin decides on the page (Save asks for the confirmation) or brings a
+   * plugin release whose patches fit.
+   */
+  async function holdForDecision(plan, settings) {
+    const items = plan.confirmationNeeded.map((c) => ({ id: c.id, title: c.title, risk: c.risk ?? null, reason: c.reason ?? null }));
+    const signature = `${items.map((i) => i.id).sort().join(",")}@${plan.paperclipVersion ?? "?"}`;
+    const prev = await ctx.state.get(UPDATE_DECISION_KEY).catch(() => null);
+    const same = prev?.signature === signature;
+    const names = items.map((i) => i.title).join(", ");
+    log.error(`protections NOT re-applied, nothing was rebuilt: ${names} no longer fit this Paperclip (${plan.paperclipVersion ?? "unknown version"}) and need an admin decision`);
+    let alerted = same ? Boolean(prev.alerted) : false;
+    if (!alerted) {
+      const lines = items.map((i) => `- **${i.title}**: ${i.reason ?? "does not fit"}${i.risk ? ` If it is dropped: ${i.risk}` : ""}`);
+      const a = await raiseAlertIssue({ ctx, settings, priority: "high", metadata: { source: "update-needs-decision", protections: items.map((i) => i.id), paperclipVersion: plan.paperclipVersion ?? null },
+        title: `[Security hardening] Paperclip update: ${names} no longer fit${items.length === 1 ? "s" : ""}, admin decision needed`.slice(0, 240),
+        description: `On start the plugin found switched-on safety protections that no longer fit the Paperclip files (version ${plan.paperclipVersion ?? "unknown"}):\n\n${lines.join("\n")}\n\n`
+          + "Rebuilding the files would have removed them silently, so the plugin changed NOTHING: no protection was re-applied by this start. The files stay as they are, which means that after a Paperclip update that replaced them none of the protections is in the files until you act. "
+          + "Open the Hardening page (status \"update needs admin decision\"): install a plugin release that carries patches for this Paperclip, or Save to rebuild without the listed protections after confirming that you accept the risk." });
+      alerted = a.ok;
+    }
+    await ctx.state.set(UPDATE_DECISION_KEY, { at: same && prev.at ? prev.at : new Date().toISOString(), paperclipVersion: plan.paperclipVersion ?? null, signature, alerted, protections: items }).catch(() => {});
+    await logActivity(null, settings, `Security hardening: update needs admin decision (${names}); nothing was re-applied`, { protections: items.map((i) => i.id), paperclipVersion: plan.paperclipVersion ?? null });
+    return { ok: false, applied: false, needsDecision: true, protections: items.map((i) => i.id), error: `${names} no longer fit${items.length === 1 ? "s" : ""} this Paperclip; nothing was rebuilt` };
+  }
+  const clearDecision = () => ctx.state.set(UPDATE_DECISION_KEY, null).catch(() => {});
 
   const api = {
     assertAdmin,
@@ -305,6 +339,7 @@ export function createHardening({ ctx, engineOptions = {}, resolveTargetFn = res
       for (const [id, res] of Object.entries(st?.results ?? {})) {
         if (withFiles[id] && res?.filesKey === filesKey(withFiles[id], status.files)) selfTests[id] = { ...res, at: st.at, trigger: st.trigger };
       }
+      const decision = await ctx.state.get(UPDATE_DECISION_KEY).catch(() => null);
       const hosts = hostStatusFn ? await hostStatusFn().catch((e) => { log.warn(`host install status unavailable: ${e.message}`); return null; }) : null;
       const info = engine.restartInfo();
       const started = status.serverStartedAt;
@@ -317,7 +352,8 @@ export function createHardening({ ctx, engineOptions = {}, resolveTargetFn = res
         tree: status.tree,
         paperclipVersion: status.paperclipVersion,
         enabled: status.enabled,
-        protections: PROTECTIONS.map((p) => rowFor(p, byId[p.id], unavailable[p.id] ?? null, selfTests[p.id] ?? null, hosts)),
+        protections: PROTECTIONS.map((p) => rowFor(p, byId[p.id], unavailable[p.id] ?? null, selfTests[p.id] ?? null, hosts, decision?.protections?.find((d) => d.id === p.id) ?? null)),
+        updateDecision: decision?.protections?.length ? { at: decision.at ?? null, paperclipVersion: decision.paperclipVersion ?? null, protections: decision.protections } : null,
         selfTest: st ? { at: st.at ?? null, trigger: st.trigger ?? null, waitingRestart: Boolean(st.waitingRestart), failed: st.failed ?? [] } : null,
         watchdog: hosts?.watchdog ?? null,
         hermes: hosts?.hermes ?? null,
@@ -359,6 +395,7 @@ export function createHardening({ ctx, engineOptions = {}, resolveTargetFn = res
         availabilityCache = null;
         const summary = summarizePlan(plan, req.switchedOff);
         if (!result.ok) return { ok: false, error: result.error, plan: summary };
+        await clearDecision(); // the admin decided (a plan that drops a core protection needed the confirmation)
         const after = (await engine.status()).enabled;
         const changedSet = before.join(",") !== after.join(",");
         if (result.changed.length || changedSet) {
@@ -459,6 +496,8 @@ export function createHardening({ ctx, engineOptions = {}, resolveTargetFn = res
         const enabled = (await engine.status()).enabled;
         if (!enabled.length) return { ok: true, applied: false, reason: "nothing switched on", config: cfg };
         const plan = await engine.replan();
+        if (plan.confirmationNeeded.length) return { ...(await holdForDecision(plan, settings)), config: cfg };
+        await clearDecision();
         if (!plan.changes) return { ok: true, applied: false, reason: "files already match", config: cfg };
         const result = await engine.apply(plan);
         availabilityCache = null;
@@ -485,7 +524,7 @@ const HOST_ROWS = {
   "hermes-boxed": (h) => h?.hermes && { status: h.hermes.status, enabled: h.hermes.status !== "off", reason: `${h.hermes.path}: ${h.hermes.reason}` },
 };
 
-function rowFor(p, st, unavailableReason, selfTest = null, hosts = null) {
+function rowFor(p, st, unavailableReason, selfTest = null, hosts = null, decision = null) {
   const host = HOST_ROWS[p.id]?.(hosts);
   if (host) {
     return { id: p.id, title: p.title, description: p.description, kind: p.kind, core: p.core, risk: p.risk ?? null, requires: p.requires,
@@ -502,6 +541,11 @@ function rowFor(p, st, unavailableReason, selfTest = null, hosts = null) {
   else if (st.status === "off") status = unavailableReason ? "unavailable" : "off";
   else status = st.status; // applied | pending-restart | unavailable | drifted
   let reason = placeholder ? PLACEHOLDER_NOTE : (st?.reason ?? unavailableReason ?? null);
+  if (decision && !placeholder) {
+    // The automatic re-apply stopped because this core protection no longer fits (see holdForDecision): not "off", not "unavailable".
+    status = "needs-decision";
+    reason = `A Paperclip update changed the code this protection patches (${decision.reason ?? "it does not fit"}). Nothing was rebuilt; Save asks you to confirm dropping it.`;
+  }
   if (status === "applied" && selfTest && !selfTest.ok) {
     status = "selftest-failed";
     reason = selfTest.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`).join("; ");

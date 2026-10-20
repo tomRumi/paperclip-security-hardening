@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { EXCEPTIONABLE_TYPES } from "../src/profiles.js";
 import { DEFAULT_SETTINGS, normalizeSettings, hardeningConfigFromSettings, writeHardeningConfig, HardeningConfigRefusal, sandboxWritableRoots, CONFIG_KEYS } from "../src/settings.js";
 
 const tmp = fs.mkdtempSync(path.join(process.env.HARDENING_TEST_SCRATCH ?? os.tmpdir(), "settings-test-"));
@@ -160,4 +161,126 @@ test("writeHardeningConfig: needs the instance root and a way to check the owner
   assert.throws(() => writeHardeningConfig(S, { file }), /instance root/);
   assert.throws(() => writeHardeningConfig(S, { file, instanceRoot: "relative" }), /instance root/);
   refuses(() => writeHardeningConfig(S, { file, instanceRoot: path.dirname(file), uid: null }), /cannot be checked on this platform/);
+});
+
+// ---------- v0.2.0: per-type base allowlists and remote exceptions
+const AGENT = "0b7c3a5e-1111-2222-3333-444455556666";
+const EXC = { agentId: AGENT, type: "cursor_cloud", reason: "reviewed by the board", addedBy: "board-user-1", addedAt: "2026-10-20T08:00:00.000Z" };
+
+test("a v0.1.1 settings file reads back and writes out byte for byte unchanged", () => {
+  const v011 = {
+    schema: 1, writtenBy: "paperclip-security-hardening",
+    workspaceRoots: ["/srv/projects"], baseAllowlist: ["api.anthropic.com", "127.0.0.1:8790"], extraReadOnlyPaths: ["/opt/vault/bin"],
+    hermesWrapperPath: "/usr/local/bin/hermes-sandbox", hermesAllowlist: ["openrouter.ai"], hermesReadOnlyPaths: ["/opt/hermes"],
+  };
+  const { settings, errors } = normalizeSettings(v011);
+  assert.deepEqual(errors, []);
+  assert.deepEqual(settings.baseAllowlists, {});
+  assert.deepEqual(settings.remoteExceptions, []);
+  assert.deepEqual(hardeningConfigFromSettings(settings), v011);
+  const { instanceRoot, file } = instance();
+  writeHardeningConfig(v011, { file, instanceRoot });
+  assert.equal(fs.readFileSync(file, "utf8"), `${JSON.stringify(v011, null, 2)}\n`);
+  assert.equal(writeHardeningConfig(JSON.parse(fs.readFileSync(file, "utf8")), { file, instanceRoot }).changed, false, "reading the file and writing it again changes nothing");
+  // The older text form of the claude_local allowlist still works.
+  assert.deepEqual(normalizeSettings({ baseAllowlist: "api.anthropic.com\nx.example" }).settings.baseAllowlist, ["api.anthropic.com", "x.example"]);
+});
+
+test("the new keys are settings-file keys, written after the v0.1.1 ones and only when set", () => {
+  assert.deepEqual(CONFIG_KEYS.slice(-2), ["baseAllowlists", "remoteExceptions"]);
+  const config = hardeningConfigFromSettings({ remoteExceptions: [EXC], baseAllowlists: { codex_local: ["api.openai.com"] }, baseAllowlist: ["a.example"] });
+  assert.deepEqual(Object.keys(config), ["schema", "writtenBy", "baseAllowlist", "baseAllowlists", "remoteExceptions"]);
+  assert.deepEqual(config.baseAllowlists, { codex_local: ["api.openai.com"] });
+  assert.deepEqual(config.remoteExceptions, [EXC]);
+  assert.deepEqual(Object.keys(hardeningConfigFromSettings({ baseAllowlists: {}, remoteExceptions: [] })), ["schema", "writtenBy"]);
+});
+
+test("baseAllowlists: lists per boxed type, validHost per entry, in profile order, empty lists dropped", () => {
+  const { settings, errors } = normalizeSettings({
+    baseAllowlists: { grok_local: ["api.x.ai", "api.x.ai"], codex_local: " api.openai.com \n127.0.0.1:8790", gemini_local: [], opencode_local: ["openrouter.ai", "evil host", "*:443", "https://x.example"] },
+  });
+  assert.deepEqual(settings.baseAllowlists, { codex_local: ["api.openai.com", "127.0.0.1:8790"], opencode_local: ["openrouter.ai"], grok_local: ["api.x.ai"] });
+  assert.deepEqual(Object.keys(settings.baseAllowlists), ["codex_local", "opencode_local", "grok_local"]);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /^baseAllowlists\.opencode_local: not a host or host:port: evil host, \*:443, https:\/\/x\.example$/);
+  assert.equal(normalizeSettings({ baseAllowlists: { kimi_local: Array.from({ length: 70 }, (_, i) => `h${i}.example`) } }).settings.baseAllowlists.kimi_local.length, 64);
+});
+
+test("baseAllowlists: only boxed types with their own allowlist; the rest is reported and dropped", () => {
+  for (const type of ["claude_local", "hermes_local", "cursor_cloud", "process", "paperclip_runner", "__proto__", "constructor"]) {
+    const { settings, errors } = normalizeSettings({ baseAllowlists: JSON.parse(`{"${type}": ["a.example"]}`) });
+    assert.deepEqual(settings.baseAllowlists, {}, type);
+    assert.equal(errors.length, 1, type);
+    assert.match(errors[0], new RegExp(`^baseAllowlists: not a boxed adapter type .*claude_local uses baseAllowlist\\): ${type}$`));
+  }
+  for (const bad of ["codex_local", ["a.example"], 5]) {
+    const { settings, errors } = normalizeSettings({ baseAllowlists: bad });
+    assert.deepEqual(settings.baseAllowlists, {});
+    assert.match(errors.join(), /baseAllowlists: must be an object/);
+  }
+  assert.deepEqual(normalizeSettings({ baseAllowlists: { codex_local: 7 } }).errors, ["baseAllowlists.codex_local: must be a list"]);
+  assert.deepEqual(normalizeSettings({ baseAllowlists: null }).settings.baseAllowlists, {});
+});
+
+test("remoteExceptions: complete entries for the exceptionable types, in a fixed key order", () => {
+  const messy = { addedAt: " 2026-10-20T08:00:00Z ", addedBy: " board-user-1 ", reason: " reviewed ", type: "http", agentId: ` ${AGENT} `, extra: "dropped" };
+  const { settings, errors } = normalizeSettings({ remoteExceptions: [messy] });
+  assert.deepEqual(errors, []);
+  assert.deepEqual(settings.remoteExceptions, [{ agentId: AGENT, type: "http", reason: "reviewed", addedBy: "board-user-1", addedAt: "2026-10-20T08:00:00Z" }]);
+  assert.deepEqual(Object.keys(settings.remoteExceptions[0]), ["agentId", "type", "reason", "addedBy", "addedAt"]);
+  for (const type of EXCEPTIONABLE_TYPES) assert.deepEqual(normalizeSettings({ remoteExceptions: [{ ...EXC, type }] }).errors, [], type);
+  assert.deepEqual(EXCEPTIONABLE_TYPES, ["cursor_cloud", "openclaw_gateway", "hermes_gateway", "http", "process"]);
+});
+
+test("remoteExceptions: a type that is not exceptionable is rejected, whatever the reason given", () => {
+  for (const type of ["claude_local", "codex_local", "hermes_local", "paperclip_runner", "acpx_local", "some_plugin_adapter", "", "__proto__"]) {
+    const { settings, errors } = normalizeSettings({ remoteExceptions: [{ ...EXC, type }] });
+    assert.deepEqual(settings.remoteExceptions, [], type);
+    assert.match(errors.join(), /^remoteExceptions\[0\]: type must be one of cursor_cloud, openclaw_gateway, hermes_gateway, http, process/, type);
+  }
+});
+
+test("remoteExceptions: every field is required and checked; bad entries are dropped one by one", () => {
+  const cases = [
+    [{ ...EXC, agentId: "../x" }, /agentId is not a valid id/],
+    [{ ...EXC, agentId: undefined }, /agentId is not a valid id/],
+    [{ ...EXC, reason: "  " }, /reason is required/],
+    [{ ...EXC, reason: "x".repeat(501) }, /reason is required/],
+    [{ ...EXC, addedBy: "" }, /addedBy is required/],
+    [{ ...EXC, addedAt: "yesterday" }, /addedAt must be an ISO 8601/],
+    [{ ...EXC, addedAt: "2026-13-45T00:00:00Z" }, /addedAt must be an ISO 8601/],
+    [AGENT, /must be an object/],
+    [null, /must be an object/],
+    [[EXC], /must be an object/],
+  ];
+  for (const [entry, re] of cases) {
+    const { settings, errors } = normalizeSettings({ remoteExceptions: [entry] });
+    assert.deepEqual(settings.remoteExceptions, []);
+    assert.match(errors.join(), re);
+  }
+  const mixed = normalizeSettings({ remoteExceptions: [EXC, { ...EXC, agentId: "b2", reason: "" }, { ...EXC, agentId: "c3", type: "process" }] });
+  assert.deepEqual(mixed.settings.remoteExceptions.map((e) => e.agentId), [AGENT, "c3"]);
+  assert.match(mixed.errors.join(), /^remoteExceptions\[1\]: reason is required/);
+  const twice = normalizeSettings({ remoteExceptions: [EXC, { ...EXC, type: "http" }] });
+  assert.equal(twice.settings.remoteExceptions.length, 1);
+  assert.match(twice.errors.join(), /listed twice/);
+  assert.deepEqual(normalizeSettings({ remoteExceptions: "agent-1" }).errors, ["remoteExceptions: must be a list"]);
+  const many = Array.from({ length: 300 }, (_, i) => ({ ...EXC, agentId: `a${i}` }));
+  assert.equal(normalizeSettings({ remoteExceptions: many }).settings.remoteExceptions.length, 256);
+});
+
+test("writeHardeningConfig writes the new keys with the same 0600/0700 checks, and rewrites only on change", () => {
+  const { instanceRoot, file } = instance();
+  const s = { baseAllowlists: { cursor: ["api2.cursor.sh"] }, remoteExceptions: [EXC] };
+  const a = writeHardeningConfig(s, { file, instanceRoot });
+  assert.equal(a.changed, true);
+  assert.deepEqual(a.config, { schema: 1, writtenBy: "paperclip-security-hardening", baseAllowlists: { cursor: ["api2.cursor.sh"] }, remoteExceptions: [EXC] });
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(path.dirname(file)).mode & 0o777, 0o700);
+  assert.equal(writeHardeningConfig(s, { file, instanceRoot }).changed, false);
+  fs.chmodSync(file, 0o644);
+  refuses(() => writeHardeningConfig({ ...s, remoteExceptions: [] }, { file, instanceRoot }), /mode 644; it must be 0600/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).remoteExceptions, [EXC], "a refused write changes nothing");
+  const { instanceRoot: root2 } = instance();
+  refuses(() => writeHardeningConfig(s, { file: path.join(root2, "companies", "c", "config.json"), instanceRoot: root2 }), /lies inside/);
 });
