@@ -37,7 +37,9 @@
 //   issue.documents.write  the two read-only documents (hardening-status, itsec-context) the plugin keeps on its
 //                        status issue in the host company; the ITSec agent reads its facts from there
 //   issue.comments.read  the safety-net check: an open alert issue of the host company is "untriaged" while the ITSec
-//                        agent has not commented on it (src/itsec.js); comments are read, never edited
+//                        agent has not commented on it (src/itsec.js), and the alert re-check: it reads an alert's
+//                        comments to verify the ITSec agent's resolution comment before a close of it (src/recheck.js);
+//                        comments are read, never edited
 //   plugin.state.read/write  the install-wide site settings and caps template (scope "instance"), per-company box
 //                        settings, caps and usage snapshots, and the caps job state
 //   ui.page.register     the "Hardening" and "Agent boxes" pages
@@ -61,7 +63,7 @@ export const PLUGIN_ID = "paperclip-security-hardening";
 const manifest = {
   id: PLUGIN_ID,
   apiVersion: 1,
-  version: "0.1.0",
+  version: "0.1.1",
   displayName: "Security hardening",
   description: "Switches the sandbox protections on and off (each one rebuilt from Paperclip's original files, one restart per save), keeps the site values in one settings file, and verifies every agent's sandbox configuration.",
   author: "tomRumi",
@@ -113,7 +115,7 @@ const manifest = {
     { jobKey: "daily-token-caps", displayName: "Daily token caps", description: "Counts each agent's tokens today, pauses agents over their cap or company cap, resumes them at the next UTC day.", schedule: "*/5 * * * *" },
     { jobKey: "watchdog-heartbeat", displayName: "Watchdog heartbeat check", description: "Raises one alert when the enrolled watchdog has not reported in for more than 30 minutes.", schedule: "*/10 * * * *" },
     { jobKey: "itsec-reconcile", displayName: "ITSec agent check", description: "In the host company only: makes sure the ITSec agent and its routines exist, verifies its sandbox before its first run and pauses it on drift, refreshes its status documents, and starts alert triage when an alert still has no verdict.", schedule: "*/15 * * * *" },
-    { jobKey: "alert-recheck", displayName: "Alert tamper re-check", description: "Re-raises, as a HIGH alert naming who did it, any recent alert issue of this plugin that someone other than an alert owner closed, cancelled or deleted.", schedule: "*/10 * * * *" }
+    { jobKey: "alert-recheck", displayName: "Alert tamper re-check", description: "Re-raises, as a HIGH alert naming who did it, any recent alert issue of this plugin that someone other than an alert owner closed, cancelled or deleted. The host company's ITSec agent may close one only after its own resolution comment with evidence; those closes are listed in its status document.", schedule: "*/10 * * * *" }
   ],
   webhooks: [
     { endpointKey: "watchdog", displayName: "Watchdog reports", description: "Enrolment (one-time code), heartbeats and alerts from the host watchdog, each signed with its enrolled Ed25519 key." }

@@ -1,8 +1,8 @@
 {
   "comment": "Written by scripts/release.sh. The plugin shows the one-line install commands from these values.",
-  "version": "0.1.0",
-  "baseUrl": "https://github.com/tomRumi/paperclip-security-hardening/releases/download/v0.1.0/",
-  "installWatchdogSha256": "6a95da5501f6387d82c36dbbb6adbc02437ddac861e1b9aa64b3889571d6b338",
-  "installHermesSha256": "0fde9b8c3769064d1f89af970e0891161812d14cf31b3b1026a3a81aa8546f69",
+  "version": "0.1.1",
+  "baseUrl": "https://github.com/tomRumi/paperclip-security-hardening/releases/download/v0.1.1/",
+  "installWatchdogSha256": "4b840c65a062c2e06399f58e702c208b636e6bed5e1cddbd9f55be1d45925548",
+  "installHermesSha256": "1c65190d08b5de359bdab5e089384ae386618b6c9555d0eac4d7418db46dd333",
   "hermesWrapperSha256": "474699399010c4e0e850d4674c91463da49263adb0471eae1524b2a0540318a6"
 }

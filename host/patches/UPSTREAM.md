@@ -17,7 +17,7 @@ user and not group- or world-writable. Without the file they use secure generic 
 | 0002 | server `routes/agents` | Agents cannot change sandbox, network, command, instructions or skills keys of an agent (board-only) |
 | 0003 | server `services/heartbeat` | Forces the stored sandbox config at every spawn; drops launch-changing env; refuses workspaces outside the allowed roots |
 | 0004 | adapter-utils `local-process-sandbox` | Allowlist proxy survives a client reset (EPIPE) instead of taking the server down |
-| 0005a | server `services/agents` | New agents (create, hire, import, join) start boxed with the base allowlist, no create-agent or create-skill right |
+| 0005a | server `services/agents` | New agents (create, hire, import, join) start boxed (Claude CLI engine) with the base allowlist, no create-agent or create-skill right |
 | 0005b | server `services/heartbeat` | Fail closed: an agent without a sandbox (or a Hermes agent without the wrapper) is refused at spawn |
 | 0005c | server `routes/agents` | New agents get no default task-assign grant |
 | 0005d | server `services/company-portability` | Same for agents created by company import |
@@ -161,11 +161,13 @@ let it run with no sandbox. (b) The hire approval payload stores the redacted di
 `networkAllowlist` entries were persisted as the literal string `***REDACTED***`.
 
 **0005a.** `create()` and `activatePendingApproval()` call `applyNewAgentSafeDefaults()`: `canCreateAgents=false`;
-for `claude_local`: `filesystemScope=workspace`, `filesystemSandboxCommand=/usr/bin/bwrap`, base
+for `claude_local`: `engine=cli` (see below), `filesystemScope=workspace`, `filesystemSandboxCommand=/usr/bin/bwrap`, base
 `filesystemExtraPaths` (the settings file's `extraReadOnlyPaths`, for example a credential broker's `/opt/vault/bin`), `networkScope=allowlist` with only the settings file's `baseAllowlist` (default `api.anthropic.com`); for `hermes_local`: `command` = the settings file's `hermesWrapperPath` (default `/usr/local/bin/hermes-sandbox`) and `env.HERMES_SANDBOX_ALLOW` (`hermesAllowlist`, default `openrouter.ai`; **no other model-provider host unless you configure one**) plus `env.HERMES_SANDBOX_RO` (`hermesReadOnlyPaths`, which must list the Hermes install directories). All of these come from the settings file, read once at startup (`$PAPERCLIP_HARDENING_CONFIG`, else `<instance root>/hardening/config.json`); an empty or missing value falls back to the secure default. The patch ignores creator-supplied
 values for those keys (warn log `event=new_agent_defaults`); other adapter types (e.g. `codex_local`) only get `canCreateAgents=false`. Constants live in the `NEW_AGENT_SAFE_DEFAULTS` block of
 the patched server file (not agent-writable). Board PATCH (`updateAgent`) is untouched, so extra hosts are added later;
 existing agents are not modified.
+
+*Engine (claude_local).* The adapter's `engine` default is `auto`, which means ACP (`adapter-claude-local` `config-schema.js`: "Default (ACP)"; `acp.js` `normalizeEngine()` maps an unset, empty, `auto` or unknown value to ACP, not explicit). `resolveClaudeExecutionEngineForRun()` (`acp.js`, called from `execute.js` before anything is spawned) returns an `adapter_engine_unavailable` error for every non-`cli` selection when `filesystemScope` or `networkScope` is set: "Local filesystem/network confinement requires the Claude CLI engine; ACP confinement is not supported." Without the engine key, a new agent boxed by this patch would be refused at its first run. So `applyNewAgentSafeDefaults()` sets `engine=cli` when the creator's value is missing or not an explicit engine (`auto`, empty, non-string, unknown). **An explicit `cli` or `acp` is kept** (the adapter compares trimmed and lower-cased; the value is stored as given): this is the one key the patch does not overwrite, because it is not a security setting. An explicit `acp` on a boxed agent is refused at run time with the message above (fail closed, never unboxed), and the board fixes it by setting `engine=cli`. Verified on 2026.1012.0 (`adapter-claude-local` 2026.1012.0, `dist/server/acp.js:19-46`, `execute.js:260-274`). The plugin's compliance check (`checkAgent`) does not flag the engine: an ACP boxed agent is a function problem, not a security gap; the ITSec check (`checkItsecAgent`) requires `cli`, as does the ITSec declaration.
 
 **0005b.** `refuseUnsandboxedLocalAgent()`, called right after the 0003 hook, refuses the run (error `Sandbox policy: run refused, ...`, warn log
 `event=sandbox_enforcement action=refuse_unsandboxed`) for: `claude_local` without a stored

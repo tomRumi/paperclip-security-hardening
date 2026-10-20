@@ -60,12 +60,35 @@ test("no settings file: secure generic defaults", () => {
   assert.deepEqual([...b3.warnings, ...b5.warnings], [], "a missing file is not worth a warning");
   // Creator-supplied values are still overridden; with no Hermes read-only setting the wrapper keeps its own default.
   const c = b5.applyNewAgentSafeDefaults("claude_local", creator.claude, { canCreateAgents: true, canCreateSkills: true }, "create");
-  assert.deepEqual(c.adapterConfig, { ...creator.claude, filesystemScope: "workspace", filesystemSandboxCommand: "/usr/bin/bwrap", filesystemExtraPaths: [], networkScope: "allowlist", networkAllowlist: ["api.anthropic.com"] });
+  assert.deepEqual(c.adapterConfig, { ...creator.claude, engine: "cli", filesystemScope: "workspace", filesystemSandboxCommand: "/usr/bin/bwrap", filesystemExtraPaths: [], networkScope: "allowlist", networkAllowlist: ["api.anthropic.com"] });
   assert.deepEqual(c.permissions, { canCreateAgents: false, canCreateSkills: false });
   const hm = b5.applyNewAgentSafeDefaults("hermes_local", creator.hermes, {}, "create").adapterConfig;
   assert.equal(hm.command, "/usr/local/bin/hermes-sandbox");
   assert.deepEqual(hm.env, { HERMES_SANDBOX_ALLOW: { type: "plain", value: "openrouter.ai" }, KEEP: "1" });
 });
+
+// The claude_local adapter's default engine is ACP ("auto"/unset/unknown), and it refuses ACP under a filesystem or network
+// scope (execution engine "requires the Claude CLI engine"). A new boxed agent therefore starts on the CLI engine unless its
+// creator explicitly chose one: an explicit "cli" stays, and so does an explicit "acp" (that agent is refused at run time, which
+// is safe and says how to fix it; the patch does not override a deliberate choice).
+for (const name of P0005A) {
+  test(`${name}: a new claude_local agent starts on the CLI engine; an explicit engine is kept`, () => {
+    const b5 = evalBlock(pkg0005a(name), "0005a", { instanceRoot: freshRoot() });
+    const engineOf = (cfg, source = "create") => b5.applyNewAgentSafeDefaults("claude_local", cfg, {}, source).adapterConfig.engine;
+    assert.equal(engineOf({ model: "x" }), "cli", "unset");
+    for (const v of ["auto", "AUTO", "", "  ", "bogus", null, 7, true, {}, []]) assert.equal(engineOf({ engine: v }), "cli", JSON.stringify(v));
+    assert.equal(engineOf({ engine: "cli" }), "cli");
+    assert.equal(engineOf({ engine: "acp" }), "acp");
+    assert.equal(engineOf({ engine: " ACP " }), " ACP ", "kept as given (the adapter trims and lowercases too)");
+    assert.equal(engineOf({ engine: "CLI " }), "CLI ");
+    assert.equal(engineOf({ model: "x" }, "approval_activation"), "cli", "approval path");
+    assert.equal(engineOf(undefined), "cli", "no adapterConfig at all");
+    // Nothing else changes with it, and other adapter types get no engine key.
+    const c = b5.applyNewAgentSafeDefaults("claude_local", creator.claude, {}, "create").adapterConfig;
+    assert.deepEqual({ ...c, engine: undefined }, { ...creator.claude, engine: undefined, filesystemScope: "workspace", filesystemSandboxCommand: "/usr/bin/bwrap", filesystemExtraPaths: [], networkScope: "allowlist", networkAllowlist: ["api.anthropic.com"] });
+    for (const type of ["hermes_local", "codex_local"]) assert.equal("engine" in b5.applyNewAgentSafeDefaults(type, { model: "m" }, {}, "create").adapterConfig, false, type);
+  });
+}
 
 test("no settings file: PAPERCLIP_SANDBOX_WORKSPACE_ROOT still works as before", () => {
   const b3 = evalBlock(pkg0003(), "0003", { instanceRoot: freshRoot(), env: { PAPERCLIP_SANDBOX_WORKSPACE_ROOT: "/srv/a:relative:/srv/b/" } });
@@ -124,8 +147,12 @@ test("with the live install's settings the package patches behave exactly like t
   const live5 = evalBlock(blockFromPatchFile(path.join(LIVE, P0005A[1]), "0005a"), "0005a", { env });
   const pkg5 = evalBlock(pkg0005a(), "0005a", { instanceRoot: root, env });
   assert.deepEqual(pkg5.NEW_AGENT_SAFE_DEFAULTS, live5.NEW_AGENT_SAFE_DEFAULTS);
-  for (const [type, cfg] of [["claude_local", creator.claude], ["hermes_local", creator.hermes], ["codex_local", { model: "m" }], ["hermes_local", {}]])
-    assert.deepEqual(pkg5.applyNewAgentSafeDefaults(type, cfg, { canAssignTasks: true }, "create"), live5.applyNewAgentSafeDefaults(type, cfg, { canAssignTasks: true }, "create"), type);
+  // The only difference from the (older) live patch: a new boxed claude_local agent gets engine "cli" (see the engine tests below).
+  for (const [type, cfg] of [["claude_local", creator.claude], ["hermes_local", creator.hermes], ["codex_local", { model: "m" }], ["hermes_local", {}]]) {
+    const ours = pkg5.applyNewAgentSafeDefaults(type, cfg, { canAssignTasks: true }, "create");
+    if (type === "claude_local") { assert.equal(ours.adapterConfig.engine, "cli"); delete ours.adapterConfig.engine; }
+    assert.deepEqual(ours, live5.applyNewAgentSafeDefaults(type, cfg, { canAssignTasks: true }, "create"), type);
+  }
   const live3 = evalBlock(blockFromPatchFile(path.join(LIVE, P0003), "0003"), "0003", { env });
   const pkg3 = evalBlock(pkg0003(), "0003", { instanceRoot: root, env });
   assert.deepEqual(pkg3.SANDBOX_WORKSPACE_ROOTS, live3.SANDBOX_WORKSPACE_ROOTS);

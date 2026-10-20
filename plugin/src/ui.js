@@ -174,7 +174,7 @@ function ItsecCard({ context, site, onSaved }) {
       h("textarea", { rows: 4, value: form.context, onChange: (e) => setForm({ ...form, context: e.target.value }) })) : null);
   return h("section", { style: { ...box, display: "grid", gap: 8 } },
     h("h3", null, "ITSec agent"),
-    h("p", { style: muted }, "A sandboxed security agent the plugin creates in ONE company, the host company. It triages the alert issues of that company (comments only, never closes them) and reviews the host's safety automation daily. Nothing is created until a company is marked."),
+    h("p", { style: muted }, "A sandboxed security agent the plugin creates in ONE company, the host company. It triages the alert issues of that company (it closes one only after a resolution comment with evidence, otherwise it escalates to the owner) and reviews the host's safety automation daily. Nothing is created until a company is marked."),
     message ? h(StatusBadge, { label: message.text, status: message.tone }) : null,
     !st.configured ? h("div", { style: { display: "grid", gap: 8 } },
       h("p", null, "No host company is marked: there is no ITSec agent."),

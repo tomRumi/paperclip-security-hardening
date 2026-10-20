@@ -115,8 +115,8 @@ export function register(ctx, { hardening, boxes, caps, hosts, recheck, itsec } 
   ctx.jobs.register("watchdog-heartbeat", async () => { await w.checkHeartbeat(); });
 
   // Alert tamper re-check (src/recheck.js): close events of the plugin's alert issues carry the actor; the job
-  // re-raises an alert that someone other than an alert owner closed, cancelled, deleted or hid.
-  const r = recheck ?? createAlertRecheck({ ctx });
+  // re-raises an alert that someone other than an alert owner (or the ITSec agent, with a resolution comment) closed, cancelled, deleted or hid.
+  const r = recheck ?? createAlertRecheck({ ctx, loadSettings: () => h.loadSettings() });
   ctx.events?.on?.("issue.updated", async (event) => { await noteCompanyEvent(ctx, event?.companyId); return r.recordEvent(event); });
   ctx.jobs.register("alert-recheck", async () => {
     const res = await r.runJob();

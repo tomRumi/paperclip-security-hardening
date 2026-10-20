@@ -1,4 +1,4 @@
-// The plugin-managed ITSec agent: a sandboxed, comment-only security agent that exists in ONE company, the host company
+// The plugin-managed ITSec agent: a sandboxed security agent with no host write access that exists in ONE company, the host company
 // the operator marked (setting itsecHostCompanyId). No SDK imports: the plugin context (`ctx`) is passed in, so tests
 // use a fake one. This file is the only place that calls ctx.agents.managed and ctx.routines.managed (a source-scan
 // test enforces it). Every call goes through `hostCompany()`, which throws for any company that is not the marked one,
@@ -36,7 +36,7 @@ import { raiseAlertIssue } from "./alerts.js";
 import { PLUGIN_ID } from "./manifest.js";
 import { effectiveBase } from "./boxes.js";
 import {
-  ITSEC_AGENT_KEY, TRIAGE_ROUTINE_KEY, DAILY_ROUTINE_KEY, ITSEC_REF_KEY, DEFAULT_ITSEC_MODEL, ITSEC_MODELS, itsecRoutineDeclarations,
+  ITSEC_AGENT_KEY, TRIAGE_ROUTINE_KEY, DAILY_ROUTINE_KEY, ITSEC_REF_KEY, ITSEC_CLOSED_KEY, DEFAULT_ITSEC_MODEL, ITSEC_MODELS, itsecRoutineDeclarations,
 } from "./itsec-declarations.js";
 
 export { ITSEC_AGENT_KEY, TRIAGE_ROUTINE_KEY, DAILY_ROUTINE_KEY };
@@ -266,6 +266,8 @@ export function createItsec({ ctx, loadSettings, statusSnapshot = null, raiseAle
     return String(created.id);
   }
 
+  const oneLine = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+
   /** hardening-status: a read-only snapshot (rewritten on every run, see writeDocuments). */
   async function statusBody(companyId) {
     const lines = ["# Hardening status", "", "Written by the Security hardening plugin. Read-only: edit nothing here.", ""];
@@ -287,6 +289,11 @@ export function createItsec({ ctx, loadSettings, statusSnapshot = null, raiseAle
       lines.push(bad.length ? `${bad.length} of ${results.length} agents are not compliant:` : `All ${results.length} agents are compliant.`);
       for (const r of bad) lines.push(`- ${r.name} (${r.adapterType}): ${r.findings.join("; ")}`);
     } catch (e) { lines.push(`Could not be checked: ${e.message}`); }
+    // Written by the alert re-check (src/recheck.js): every alert the ITSec agent closed with a valid resolution comment.
+    const closed = (await ctx.state.get(ITSEC_CLOSED_KEY(companyId)).catch(() => null)) ?? [];
+    lines.push("", "## Alerts closed by the ITSec agent", "", "Maintained by the plugin, newest first (the last 50). The owner reads this list.", "");
+    if (!Array.isArray(closed) || !closed.length) lines.push("None.");
+    else for (const x of closed.slice(-50).reverse()) lines.push(`- ${x.identifier ?? x.issueId}: ${oneLine(x.title)}. Closed ${x.closedAt}. Resolution: ${oneLine(x.resolution)}`);
     const st = await getState(companyId);
     lines.push("", "## ITSec agent", "", `Last verification: ${st.lastVerify ? `${st.lastVerify.ok ? "compliant" : st.lastVerify.state}${st.lastVerify.findings?.length ? ` (${st.lastVerify.findings.join("; ")})` : ""}` : "not run yet"}.`);
     return lines.join("\n") + "\n";

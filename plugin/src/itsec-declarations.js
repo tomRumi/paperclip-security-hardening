@@ -14,6 +14,9 @@ export const TRIAGE_ROUTINE_KEY = "itsec-triage";
 export const DAILY_ROUTINE_KEY = "itsec-daily-review";
 /** Company state: {agentId, ...} of the managed ITSec agent, written by src/itsec.js (read by the alert re-check). */
 export const ITSEC_REF_KEY = (companyId) => ({ scopeKind: "company", scopeId: String(companyId), stateKey: "itsec-agent" });
+/** Company state: [{issueId, identifier, title, closedAt, resolution}] (newest last) of the alerts the ITSec agent closed with a valid
+ *  resolution comment. Written by the alert re-check (src/recheck.js), listed in the hardening-status document (src/itsec.js). */
+export const ITSEC_CLOSED_KEY = (companyId) => ({ scopeKind: "company", scopeId: String(companyId), stateKey: "itsec-closed-alerts" });
 /** The model the agent is created with, and the models the settings page accepts as the advisory value. */
 export const DEFAULT_ITSEC_MODEL = "claude-sonnet-5-5";
 export const ITSEC_MODELS = Object.freeze([DEFAULT_ITSEC_MODEL, "claude-opus-5-5", "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"]);
@@ -25,7 +28,7 @@ export const itsecAgentDeclaration = Object.freeze({
   displayName: "ITSec",
   role: "general",
   title: "Host security agent",
-  capabilities: "Triages the security alerts of this company and reviews the host's safety automation daily. Comments and reports findings; changes nothing.",
+  capabilities: "Triages the security alerts of this company, resolves and closes them with an evidence-backed resolution comment or escalates them to the owner, and reviews the host's safety automation daily. Changes nothing on the host.",
   // Only claude_local is modelled by the sandbox checks. adapterPreference is not used: it would pick the company's
   // most-used adapter.
   adapterType: "claude_local",
@@ -62,7 +65,7 @@ export const itsecRoutineDeclarations = Object.freeze([
   {
     routineKey: TRIAGE_ROUTINE_KEY,
     title: "ITSec: alert triage",
-    description: "Read the new security alert issues of this company and comment on each with a verdict and evidence. Started by the Security hardening plugin when an alert of medium priority or higher is raised (and by its safety-net check when an alert still has no verdict). It has no schedule of its own.",
+    description: "Read the new security alert issues of this company; for each, resolve and close it with a resolution comment that names its evidence, or escalate it to the owner. Started by the Security hardening plugin when an alert of medium priority or higher is raised (and by its safety-net check when an alert still has no verdict). It has no schedule of its own.",
     assigneeRef: assignee,
     status: "paused", // activated by the plugin after the agent was verified
     priority: "high",

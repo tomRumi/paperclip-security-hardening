@@ -8,14 +8,13 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import manifest from "../src/manifest.js";
-import { itsecAgentDeclaration, itsecRoutineDeclarations, ITSEC_REF_KEY, ITSEC_MODELS, DEFAULT_ITSEC_MODEL } from "../src/itsec-declarations.js";
+import { itsecAgentDeclaration, itsecRoutineDeclarations, ITSEC_REF_KEY, ITSEC_CLOSED_KEY, ITSEC_MODELS, DEFAULT_ITSEC_MODEL } from "../src/itsec-declarations.js";
 import {
   createItsec, checkItsecAgent, NotHostCompanyError, PROVISION_REASON, ITSEC_STATE_KEY, ITSEC_RETIRE_KEY, STATUS_ISSUE_ORIGIN,
   ITSEC_AGENT_KEY, TRIAGE_ROUTINE_KEY, DAILY_ROUTINE_KEY, NUDGE_DEBOUNCE_MS, MAX_SWEEP_ATTEMPTS, ALERT_ORIGIN,
 } from "../src/itsec.js";
 import { checkAgent } from "../src/logic.js";
 import { raiseAlertIssue, setAlertListener } from "../src/alerts.js";
-import { createAlertRecheck } from "../src/recheck.js";
 import { createHardening, NotAllowedError } from "../src/hardening.js";
 import { DEFAULT_SETTINGS, normalizeSettings } from "../src/settings.js";
 import { register } from "../src/worker.js";
@@ -234,14 +233,20 @@ function scrubPatterns() {
   return patterns;
 }
 
-test("instructions: AGENTS.md, TRIAGE.md and DAILY-REVIEW.md ship, are generic (no server specifics) and keep the comment-only rule", () => {
+test("instructions: AGENTS.md, TRIAGE.md and DAILY-REVIEW.md ship, are generic (no server specifics) and document the resolution comment format and the escalation rule", () => {
   const ins = itsecAgentDeclaration.instructions;
   assert.equal(ins.entryFile, "AGENTS.md");
   assert.deepEqual(Object.keys(ins.files).sort(), ["DAILY-REVIEW.md", "TRIAGE.md"]);
   const all = [ins.content, ...Object.values(ins.files)];
   const scrub = scrubPatterns();
   for (const text of all) for (const re of scrub) assert.doesNotMatch(text, re, `${re} in the instructions`);
-  assert.match(ins.content, /Never change its status or its assignee/);
+  assert.match(ins.content, /Never cancel or reopen an alert, and never change its assignee or priority/);
+  assert.match(ins.content, /first line must start with `Resolution:`, a later line must start with `Evidence:`/);
+  assert.match(ins.content, /ONLY after you posted your own resolution comment/);
+  assert.match(ins.content, /For the owner:/, "real host fixes are escalated as proposals");
+  assert.doesNotMatch(all.join("\n"), /comment only|never closes|Do not close it/i, "no comment-only statements left");
+  assert.match(ins.files["TRIAGE.md"], /Resolve and close/);
+  assert.match(ins.files["DAILY-REVIEW.md"], /Alerts closed by the ITSec agent/);
   assert.match(ins.content, /itsec-context/);
   // Also on disk: the shipped files are what the manifest embeds.
   for (const f of ["AGENTS.md", "TRIAGE.md", "DAILY-REVIEW.md"]) for (const re of scrub) assert.doesNotMatch(fs.readFileSync(path.join(SRC, "itsec", f), "utf8"), re);
@@ -966,48 +971,6 @@ test("safety net: an agent that is not active (not yet verified) is not nudged",
   assert.equal(s.calls("routines.managed.run").length, 0);
 });
 
-// ------------------------------------------------------------------------------------------- comment-only
-test("comment-only: an alert closed by the ITSec agent is re-raised, naming the ITSec agent and its comment-only rule", async () => {
-  const state = new Map(), issues = new Map(), created = [], logs = [];
-  const k = (key) => `${key.scopeKind}:${key.scopeId ?? ""}:${key.stateKey}`;
-  const ctx = {
-    state: { get: async (key) => (state.has(k(key)) ? structuredClone(state.get(k(key))) : null), set: async (key, v) => { state.set(k(key), structuredClone(v)); }, delete: async (key) => { state.delete(k(key)); } },
-    config: { get: async () => ({ adminUserIds: ["u-owner"] }) },
-    activity: { log: async (e) => { logs.push(e); } },
-    issues: {
-      create: async (input) => { created.push(input); const id = `i-${created.length}`; issues.set(id, { id, companyId: input.companyId, title: input.title, description: input.description, status: input.status, completedAt: null, cancelledAt: null, hiddenAt: null }); return { id, identifier: `ENG-${created.length}` }; },
-      get: async (id, companyId) => { const i = issues.get(id); return i && i.companyId === companyId ? structuredClone(i) : null; },
-    },
-    agents: { get: async (id) => ({ id, name: id === "ag-itsec" ? "ITSec" : "Other" }) },
-    logger: { info() {}, warn() {}, error() {}, debug() {} },
-  };
-  await ctx.state.set(ITSEC_REF_KEY(HOST), { agentId: "ag-itsec" });
-  const r = createAlertRecheck({ ctx, now: () => T0 + 5 * MIN });
-  const first = await raiseAlertIssue({ ctx, now: () => T0, settings: { alertCompanyId: HOST }, title: "[Security hardening] Watchdog stopped", description: "evidence" });
-  // The ITSec agent closes it.
-  const at = new Date(T0 + MIN).toISOString();
-  Object.assign(issues.get(first.issue.issueId), { status: "done", completedAt: at });
-  await r.recordEvent({ eventId: "e1", eventType: "issue.updated", occurredAt: at, actorType: "agent", actorId: "ag-itsec", entityId: first.issue.issueId, entityType: "issue", companyId: HOST, payload: { status: "done", agentId: "ag-itsec" } });
-  const res = await r.runJob();
-  assert.equal(res[0].result, "re-raised");
-  const re = created.at(-1);
-  assert.match(re.title, /^\[RE-RAISED\]/);
-  assert.match(re.description, /agent ITSec/);
-  assert.match(re.description, /ITSec agent, which is comment-only on alerts/);
-  assert.equal(re.priority, "high");
-  assert.equal(logs.at(-1).metadata.itsecAgent, true);
-  // Another agent closing an alert: re-raised without the ITSec wording.
-  const second = await raiseAlertIssue({ ctx, now: () => T0 + 6 * MIN, settings: { alertCompanyId: HOST }, title: "[Security hardening] Self-test failed", description: "e2" });
-  Object.assign(issues.get(second.issue.issueId), { status: "done", completedAt: new Date(T0 + 7 * MIN).toISOString() });
-  await r.recordEvent({ eventId: "e2", eventType: "issue.updated", occurredAt: new Date(T0 + 7 * MIN).toISOString(), actorType: "agent", actorId: "ag-other", entityId: second.issue.issueId, entityType: "issue", companyId: HOST, payload: { status: "done", agentId: "ag-other" } });
-  const r2 = createAlertRecheck({ ctx, now: () => T0 + 9 * MIN });
-  await r2.runJob();
-  const re2 = created.at(-1);
-  assert.match(re2.title, /^\[RE-RAISED\]/);
-  assert.doesNotMatch(re2.description, /comment-only/);
-  assert.equal(logs.at(-1).metadata.itsecAgent, undefined);
-});
-
 // ------------------------------------------------------------------------------------------- documents
 test("status documents: the snapshot and the operator's notes live on one plugin status issue; a missing alert company is called out", async () => {
   const s = setup({ settings: { alertCompanyId: "", itsecContext: "Host label: lab-1\nKnowledge base project: kb" } });
@@ -1023,6 +986,25 @@ test("status documents: the snapshot and the operator's notes live on one plugin
   // The status issue is not an alert: the safety net ignores it.
   assert.equal((await s.itsec.sweep(HOST)).run, false);
   assert.ok(await s.ctx.state.get(ITSEC_STATE_KEY(HOST)));
+});
+
+test("status document: lists every alert the ITSec agent closed (newest first, one line each), or says None", async () => {
+  const s = setup();
+  await s.itsec.ensure(HOST);
+  assert.match(s.world.docs.findLast((d) => d.key === "hardening-status").body, /## Alerts closed by the ITSec agent\n\n[^\n]*\n\nNone\./);
+  await s.ctx.state.set(ITSEC_CLOSED_KEY(HOST), [
+    { issueId: "i-1", identifier: "ENG-1", title: "[Security hardening] Watchdog stopped", closedAt: "2026-10-18T10:00:00.000Z", resolution: "false alarm" },
+    { issueId: "i-2", identifier: null, title: "[Security hardening] Self-test failed", closedAt: "2026-10-19T11:30:00.000Z", resolution: "line one\n## injected heading" },
+  ]);
+  await s.itsec.ensure(HOST);
+  const body = s.world.docs.findLast((d) => d.key === "hardening-status").body;
+  const section = body.split("## Alerts closed by the ITSec agent")[1].split("\n## ")[0];
+  const items = section.split("\n").filter((l) => l.startsWith("- "));
+  assert.deepEqual(items, [
+    "- i-2: [Security hardening] Self-test failed. Closed 2026-10-19T11:30:00.000Z. Resolution: line one ## injected heading",
+    "- ENG-1: [Security hardening] Watchdog stopped. Closed 2026-10-18T10:00:00.000Z. Resolution: false alarm",
+  ]);
+  assert.doesNotMatch(section, /\n## injected/, "the agent's text cannot start a heading");
 });
 
 // ------------------------------------------------------------------------------------------- documents on the real host

@@ -8,7 +8,7 @@ export const PLUGIN_ENTITY = PLUGIN_ID;
 
 /** {issues: {issueId: {companyId, projectId, identifier, title, description, priority, source, raisedAt, reraised}}} */
 export const ALERT_LOG_KEY = Object.freeze({ scopeKind: "instance", stateKey: "alert-log" });
-/** Newest alerts kept for the re-check (older ones are dropped first); the stored text is capped. */
+/** Newest alerts kept for the re-check (older ones are dropped first, pending ones last); the stored text is capped. */
 export const MAX_TRACKED_ALERTS = 200;
 const MAX_STORED_DESCRIPTION = 8000;
 
@@ -24,7 +24,9 @@ export async function trackAlert(ctx, issueId, entry) {
   try {
     const log = (await ctx.state.get(ALERT_LOG_KEY)) ?? {};
     const issues = { ...(log.issues ?? {}), [issueId]: { ...entry, description: String(entry.description ?? "").slice(0, MAX_STORED_DESCRIPTION) } };
-    const keep = Object.entries(issues).sort(([, a], [, b]) => String(b.raisedAt).localeCompare(String(a.raisedAt))).slice(0, MAX_TRACKED_ALERTS);
+    // Alerts with a pending verification or a failed re-raise (src/recheck.js) are evicted last, whatever their age.
+    const pending = (x) => (x.verifyFailures || x.reraiseFailed ? 1 : 0);
+    const keep = Object.entries(issues).sort(([, a], [, b]) => pending(b) - pending(a) || String(b.raisedAt).localeCompare(String(a.raisedAt))).slice(0, MAX_TRACKED_ALERTS);
     await ctx.state.set(ALERT_LOG_KEY, { ...log, issues: Object.fromEntries(keep) });
     return true;
   } catch (e) {

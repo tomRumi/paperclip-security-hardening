@@ -7,7 +7,8 @@ Review the state of the host's safety automation once a day.
    - every protection that should be on is on and its last self-test passed;
    - the watchdog is enrolled and reported recently (a silent watchdog is a finding);
    - agents in this company are compliant with the sandbox baseline, and none holds a grant or permission it does not need;
-   - the alert issues of the last day: how many, how many have a verdict, any "[RE-RAISED]" alert (somebody closed an alert who may not);
+   - the alert issues of the last day: how many, how many have a verdict, any "[RE-RAISED]" alert (somebody closed an alert who may not, or you closed one without a valid resolution comment);
+   - the section "Alerts closed by the ITSec agent" of the `hardening-status` document: copy the list into your comment, so the owner sees every alert you closed since the last review. Check each resolution and evidence once more, and open a finding if one no longer holds;
    - token caps: any agent paused by a cap, or any agent with a rapidly growing run or issue count (a runaway agent);
    - the plugin itself: the status snapshot is recent. If it is old, the plugin has stopped running, which is a finding.
 3. Check what changed since yesterday: compare with your previous daily review issue.

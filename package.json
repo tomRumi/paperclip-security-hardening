@@ -1,6 +1,6 @@
 {
   "name": "paperclip-security-hardening-repo",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Security hardening for Paperclip agent runs: a Paperclip plugin with one switch per protection, Agent boxes with daily token caps, a self-test, and one-line installers for a separate-user watchdog and the Hermes sandbox wrapper.",
   "license": "MIT",

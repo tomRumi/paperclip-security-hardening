@@ -182,8 +182,12 @@ test("everything on with the package patches and the live install's settings fil
       for (const name of ["SANDBOX_WORKSPACE_ROOTS", "NEW_AGENT_SAFE_DEFAULTS"].filter((x) => x in theirs))
         assert.deepEqual(ours[name], theirs[name], `${rel}: ${name}`);
       if (id === "0005a")
-        for (const type of ["claude_local", "hermes_local", "codex_local"])
-          assert.deepEqual(ours.applyNewAgentSafeDefaults(type, { env: { HERMES_SANDBOX_RO: "/" } }, {}, "create"), theirs.applyNewAgentSafeDefaults(type, { env: { HERMES_SANDBOX_RO: "/" } }, {}, "create"));
+        for (const type of ["claude_local", "hermes_local", "codex_local"]) {
+          const mine = ours.applyNewAgentSafeDefaults(type, { env: { HERMES_SANDBOX_RO: "/" } }, {}, "create");
+          // Only difference from the older live patch: a new boxed claude_local agent starts on the CLI engine.
+          if (type === "claude_local") { assert.equal(mine.adapterConfig.engine, "cli"); delete mine.adapterConfig.engine; }
+          assert.deepEqual(mine, theirs.applyNewAgentSafeDefaults(type, { env: { HERMES_SANDBOX_RO: "/" } }, {}, "create"));
+        }
     }
   } finally { f.cleanup(); }
 });

@@ -98,8 +98,9 @@ export const FUNCTIONAL_CHECKS = {
       const c = r?.adapterConfig ?? {};
       if (c.filesystemScope !== "workspace" || c.networkScope !== "allowlist") throw new Error("the new agent is not boxed");
       if ((c.networkAllowlist ?? []).includes("*:443")) throw new Error("the creator's wildcard allowlist was kept");
+      if (c.engine !== "cli") throw new Error("a new boxed claude_local agent does not start on the CLI engine (the default ACP engine refuses to run under the box)");
       if (r.permissions?.canCreateAgents !== false || r.permissions?.canCreateSkills !== false) throw new Error("create rights were kept");
-      return "boxed (workspace + allowlist), canCreateAgents/canCreateSkills false";
+      return "boxed (workspace + allowlist) on the CLI engine, canCreateAgents/canCreateSkills false";
     },
   }],
 };

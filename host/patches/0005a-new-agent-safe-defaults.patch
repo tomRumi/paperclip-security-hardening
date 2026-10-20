@@ -11,7 +11,7 @@
  import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
  import { assertClaudeOAuthBindingInvariant, claudeOAuthBindingsMatchExactly, claudeOAuthClaimRejectedError, CLAUDE_LOCAL_ADAPTER_TYPE, readClaudeOAuthBinding, secretService, } from "./secrets.js";
  import { createDbSetupTokenCleanupStore } from "./setup-token-session.js";
-@@ -40,6 +44,156 @@
+@@ -40,6 +44,162 @@
  function jsonEqual(left, right) {
      return JSON.stringify(left) === JSON.stringify(right);
  }
@@ -143,8 +143,14 @@
 +    const nextPermissions = { ...(isPlainRecord(permissions) ? permissions : {}), canCreateAgents: NEW_AGENT_SAFE_DEFAULTS.canCreateAgents, canCreateSkills: false };
 +    let nextConfig = isPlainRecord(adapterConfig) ? { ...adapterConfig } : {};
 +    if (adapterType === "claude_local") {
++        // engine: the adapter's default (unset, "auto" or any unknown value) is ACP, which it refuses to run under a filesystem or
++        // network scope ("requires the Claude CLI engine"), so a new boxed agent would fail at its first run. Unset / "auto" / unknown
++        // becomes "cli". An explicit "cli" or "acp" is the creator's choice and is kept (explicit "acp" stays refused at run time, which
++        // is safe: the run fails, it does not run unboxed).
++        const requestedEngine = typeof nextConfig.engine === "string" ? nextConfig.engine.trim().toLowerCase() : "";
 +        nextConfig = {
 +            ...nextConfig,
++            engine: requestedEngine === "acp" || requestedEngine === "cli" ? nextConfig.engine : "cli",
 +            filesystemScope: NEW_AGENT_SAFE_DEFAULTS.filesystemScope,
 +            filesystemSandboxCommand: NEW_AGENT_SAFE_DEFAULTS.filesystemSandboxCommand,
 +            filesystemExtraPaths: [...NEW_AGENT_SAFE_DEFAULTS.filesystemExtraPaths],
@@ -168,7 +174,7 @@
  function buildConfigSnapshot(row) {
      const adapterConfig = typeof row.adapterConfig === "object" && row.adapterConfig !== null && !Array.isArray(row.adapterConfig)
          ? sanitizeRecord(row.adapterConfig)
-@@ -675,6 +829,8 @@
+@@ -675,6 +835,8 @@
                  nextConfig: adapterConfig,
                  priorConfig: null,
              });
@@ -177,7 +183,7 @@
              return db.transaction(async (tx) => {
                  const txDb = tx;
                  // Consume the stored-session claim and create the fixed definition inside
-@@ -697,8 +853,8 @@
+@@ -697,8 +859,8 @@
                      companyId,
                      role,
                      adapterType,
@@ -188,7 +194,7 @@
                      runtimeConfig,
                  })
                      .returning()
-@@ -883,6 +1039,13 @@
+@@ -883,6 +1045,13 @@
                      // request, so the new-agent creation default applies.
                      patch.permissions = normalizeAgentPermissions(patch.permissions, { context: "create" });
                  }
