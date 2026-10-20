@@ -1,0 +1,14 @@
+--- a/node_modules/@paperclipai/server/dist/routes/agents.js
++++ b/node_modules/@paperclipai/server/dist/routes/agents.js
+@@ -2911,4 +2911,11 @@
+         const companyId = req.params.companyId;
+         const type = assertKnownAdapterType(req.params.type);
++        // LOCAL-PATCH 0027: "Test environment" starts the adapter's probes (a CLI hello turn, model discovery) on THIS server as the service
++        // user, outside any agent box, and builds them from the request's adapterConfig. The route only asks for the right to create agents,
++        // which every CEO-role agent has: an agent could ask for a probe of a config of its choosing. Only a board user may start it.
++        if (req.actor.type !== "board") {
++            logger.warn({ event: "adapter_test_environment_denied", actorType: req.actor.type, agentId: req.actor.agentId ?? null, runId: req.actor.runId ?? null, companyId, adapterType: type }, "adapter test-environment denied: board users only");
++            throw forbidden("Testing an adapter environment requires a board user", { code: "adapter_test_board_only" });
++        }
+         await assertCanCreateAgentsForCompany(req, companyId);
+         const adapter = requireServerAdapter(type);

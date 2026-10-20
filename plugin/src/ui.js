@@ -10,6 +10,7 @@ const STATUS = {
   applied: { label: "applied", tone: "ok" },
   "pending-restart": { label: "pending restart", tone: "pending" },
   unavailable: { label: "unavailable on this install", tone: "warning" },
+  "needs-decision": { label: "update needs admin decision", tone: "error" },
   drifted: { label: "drifted (files changed outside the plugin)", tone: "error" },
   "selftest-failed": { label: "self-test failed", tone: "error" },
   waiting: { label: "waiting for the watchdog to report in", tone: "pending" },
@@ -24,6 +25,9 @@ const STATUS = {
 const box = { border: "1px solid rgba(127,127,127,0.3)", borderRadius: 8, padding: 12 };
 const muted = { opacity: 0.7, fontSize: "0.9em" };
 const listText = (v) => (Array.isArray(v) ? v.join("\n") : "");
+// Remote exceptions in the settings form: one per line, "agentId type reason". Who added one and when is set by the worker.
+const exceptionsText = (list) => (Array.isArray(list) ? list.map((e) => `${e.agentId} ${e.type} ${e.reason}`).join("\n") : "");
+const textExceptions = (text) => text.split("\n").map((l) => l.trim()).filter(Boolean).map((l) => { const m = /^(\S+)(?:\s+(\S+))?(?:\s+(.*))?$/.exec(l); return { agentId: m[1], type: m[2] ?? "", reason: m[3] ?? "" }; });
 const errText = (e) => (e && e.message) || String(e);
 
 function Switch({ checked, disabled, onChange, label }) {
@@ -75,8 +79,8 @@ function PlanView({ plan, confirmed, setConfirmed }) {
     plan.keptOn.length ? h("div", null, "Kept on, still needed:", items(plan.keptOn, (a) => `${a.title} (needed by ${a.neededBy.join(", ")})`)) : null,
     Object.keys(plan.unavailable).length ? h("div", null, "Unavailable on this install (left off):", items(Object.entries(plan.unavailable).map(([id, reason]) => ({ id, reason })), (u) => `${u.id}: ${u.reason}`)) : null,
     plan.confirmationNeeded.length ? h("div", { style: { ...box, borderColor: "rgba(220,60,60,0.6)" } },
-      h("strong", null, "You are switching off safety protections:"),
-      items(plan.confirmationNeeded, (c) => h("span", null, h("b", null, c.title), ": ", c.risk)),
+      h("strong", null, "You are switching off safety protections (or dropping ones that no longer fit this Paperclip):"),
+      items(plan.confirmationNeeded, (c) => h("span", null, h("b", null, c.title), c.unavailable ? ` (no longer fits this Paperclip${c.reason ? `: ${c.reason}` : ""})` : "", ": ", c.risk)),
       h("label", null, h("input", { type: "checkbox", checked: confirmed, onChange: (e) => setConfirmed(e.target.checked) }), " I understand the risk and want to switch them off.")) : null,
     h("p", { style: muted }, plan.restartNeededAfterApply ? `${plan.changes} Paperclip file(s) will be rebuilt; one restart activates the change.` : "No Paperclip file changes."));
 }
@@ -84,6 +88,8 @@ function PlanView({ plan, confirmed, setConfirmed }) {
 function SettingsForm({ settings, userId, onSave, busy }) {
   const [form, setForm] = useState(() => (settings ? { ...settings } : null));
   useEffect(() => { if (settings) setForm({ ...settings }); }, [settings]);
+  const [texts, setTexts] = useState(() => ({ opencode: listText(settings?.baseAllowlists?.opencode_local), exceptions: exceptionsText(settings?.remoteExceptions) }));
+  useEffect(() => { if (settings) setTexts({ opencode: listText(settings.baseAllowlists?.opencode_local), exceptions: exceptionsText(settings.remoteExceptions) }); }, [settings]);
   if (!form) return h("p", null, "Loading settings...");
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
   const area = (k, label, hint) => h("label", { style: { display: "grid", gap: 4 } }, h("span", null, label), h("span", { style: muted }, hint),
@@ -93,15 +99,21 @@ function SettingsForm({ settings, userId, onSave, busy }) {
   return h("div", { style: { display: "grid", gap: 10 } },
     h("p", { style: muted }, "One entry per line. An empty field uses Paperclip's secure default. New values reach Paperclip after a restart; existing agents are not changed."),
     area("baseAllowlist", "Base allowlist for new agents", "host or host:port. Default: the model API host only (api.anthropic.com); the Paperclip API is always reachable."),
+    h("label", { style: { display: "grid", gap: 4 } }, h("span", null, "Base allowlist for new OpenCode agents"),
+      h("span", { style: muted }, "host or host:port. Default: the common LLM API hosts (OpenRouter, Anthropic, OpenAI, Google); no provider is preferred, so list only the ones you use."),
+      h("textarea", { rows: 3, value: texts.opencode, onChange: (e) => setTexts({ ...texts, opencode: e.target.value }), style: { fontFamily: "monospace" } })),
     area("extraReadOnlyPaths", "Extra read-only paths for new agents", "Absolute paths. Default: none."),
     area("workspaceRoots", "Workspace roots", "Boxed runs may only use workspaces inside these. Default: Paperclip's own workspaces and projects folders."),
     input("hermesWrapperPath", "Hermes wrapper path", "Command new Hermes agents run. Default: /usr/local/bin/hermes-sandbox."),
     area("hermesAllowlist", "Hermes allowlist", "Default: the model API host only (openrouter.ai). Add the Paperclip API host:port if Hermes agents call it."),
     area("hermesReadOnlyPaths", "Hermes read-only paths", "Replaces the wrapper's default (the Hermes install), so list the Hermes install folders too. Default: the wrapper's own."),
+    h("label", { style: { display: "grid", gap: 4 } }, h("span", null, "Remote exceptions"),
+      h("span", { style: muted }, "Agents that run outside the box (types: cursor_cloud, openclaw_gateway, hermes_gateway, http, process). One per line: agent id, type, reason. Without a line here the server refuses to run such an agent. Applies without a restart; every change is logged."),
+      h("textarea", { rows: 3, value: texts.exceptions, onChange: (e) => setTexts({ ...texts, exceptions: e.target.value }), style: { fontFamily: "monospace" } })),
     input("alertCompanyId", "Alert company id", "Company that receives alert issues (watchdog alerts, failed self-test, silent watchdog). Empty: activity log only."),
     input("alertProjectId", "Alert project id", "Project for alert issues (optional)."),
     input("paperclipUrl", "Paperclip URL for the watchdog", "http(s)://host:port as the host reaches Paperclip; used in the watchdog's install command. Default: http://127.0.0.1:3100."),
-    h("div", null, h("button", { type: "button", disabled: busy, onClick: () => onSave(form) }, "Save settings")),
+    h("div", null, h("button", { type: "button", disabled: busy, onClick: () => onSave({ ...form, baseAllowlists: { ...form.baseAllowlists, opencode_local: texts.opencode }, remoteExceptions: textExceptions(texts.exceptions) }) }, "Save settings")),
     h("p", { style: muted }, `Your user id: ${userId ?? "unknown"} (an instance admin adds it to "Users who may change protections" in this plugin's settings).`));
 }
 
@@ -294,6 +306,17 @@ export function HardeningPage({ context }) {
         h("p", { style: { ...muted, margin: 0 } }, `Paperclip ${s.paperclipVersion ?? "?"} at ${s.tree}. Switches apply to the whole install (every company).`),
         s.target ? h("p", { style: { ...muted, margin: 0 } }, `Instance ${s.target.instanceId ?? "?"}, data ${s.target.dataDir}, restart ${s.target.restartUnit ? `via systemd user unit ${s.target.restartUnit}` : `by hand (${s.target.restartNote ?? "no systemd unit"})`}.`) : null),
     message ? h(StatusBadge, { label: message.text, status: message.tone }) : null,
+    s.updateDecision ? h("div", { style: { ...box, borderColor: "rgba(220,60,60,0.6)", display: "grid", gap: 4 } },
+      h("strong", null, "A Paperclip update needs your decision."),
+      h("span", null, `${s.updateDecision.protections.map((d) => d.title).join(", ")} no longer fit${s.updateDecision.protections.length === 1 ? "s" : ""} this Paperclip${s.updateDecision.paperclipVersion ? ` (${s.updateDecision.paperclipVersion})` : ""}. ${s.updateDecision.held
+        ? "The plugin rebuilt nothing, so the files are as they were. Install a plugin release that fits this Paperclip, or Save to rebuild without them after confirming."
+        : "They are skipped (still switched on) and every protection that fits was applied. Install a plugin release that fits this Paperclip."}`)) : null,
+    s.nowUpstream ? h("div", { style: { ...box, display: "grid", gap: 4 } },
+      h("strong", null, "Now part of Paperclip."),
+      h("span", null, `${s.nowUpstream.protections.map((d) => d.title).join(", ")}: Paperclip ${s.nowUpstream.paperclipVersion ?? ""} contains the change itself, so the plugin's patch is no longer needed. The protection counts as satisfied.`)) : null,
+    s.localTrusted ? h("div", { style: { ...box, borderColor: "rgba(220,60,60,0.6)", display: "grid", gap: 4 } },
+      h("strong", null, "This Paperclip runs in local_trusted mode."),
+      h("span", null, s.localTrusted)) : null,
     r?.needed ? h("div", { style: { ...box, display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center" } },
       h(StatusBadge, { label: r.settingsChanged ? "Restart needed (settings changed)" : "Restart needed", status: "pending" }),
       r.canRestart ? h("button", { type: "button", disabled: busy, onClick: onRestart }, "Restart Paperclip")
@@ -314,7 +337,7 @@ export function HardeningPage({ context }) {
             onChange: (v) => { setPlan(null); setDesired({ ...desired, [p.id]: v }); } })));
       }))),
     h("div", { style: { display: "flex", gap: 8 } },
-      h("button", { type: "button", disabled: busy || !dirty || !s.available, onClick: onSave }, "Save"),
+      h("button", { type: "button", disabled: busy || (!dirty && !s.updateDecision) || !s.available, onClick: onSave }, "Save"),
       h("button", { type: "button", disabled: busy || !s.available, onClick: onSelfTest }, "Run self-test"),
       s.selfTest?.waitingRestart ? h("span", { style: muted }, "Self-test waits for the next restart.") : null,
       dirty ? h("button", { type: "button", disabled: busy, onClick: () => { setPlan(null); setDesired(Object.fromEntries(rows.map((p) => [p.id, p.enabled]))); } }, "Discard") : null),
@@ -520,7 +543,11 @@ export function AgentBoxesPage({ context }) {
             row.managed && row.sync ? h("div", null, h(StatusBadge, { label: (SYNC[row.sync] ?? SYNC.differs).label, status: (SYNC[row.sync] ?? SYNC.differs).tone })) : null,
             row.managed ? h("div", { style: muted }, "managed by the plugin") : null,
             row.conflicts.map((c) => h("div", { key: c, style: red }, `Conflict: ${c}`)),
-            row.error ? h("div", { style: red }, row.error) : null),
+            row.error ? h("div", { style: red }, row.error) : null,
+            row.typeNote ? h("div", { style: row.typeState === "excepted" ? muted : red }, row.typeNote) : null,
+            row.findings.length ? h("ul", { style: { margin: "4px 0 0", paddingLeft: 16, fontSize: "0.9em" } }, row.findings.map((f) => h("li", { key: f }, f))) : null,
+            row.dropEnv.length ? h("div", { style: muted }, `Remove from the agent's env: ${row.dropEnv.join(", ")}`) : null,
+            row.fix ? h("details", null, h("summary", null, `Fix: PATCH /api/agents/${row.id}`), h("pre", { style: { fontFamily: "monospace", whiteSpace: "pre-wrap", margin: 0 } }, JSON.stringify(row.fix, null, 2))) : null),
           h("td", { style: cell }, row.boxable ? listCell(row.hosts, row.baseHosts, row.managed ? 0 : row.current.hiddenHosts) : h("span", { style: muted }, "-")),
           h("td", { style: cell }, row.boxable ? listCell(row.readOnlyPaths, row.basePaths, row.managed ? 0 : row.current.hiddenPaths) : h("span", { style: muted }, "-")),
           h("td", { style: cell }, permissionsText(row.permissions)),

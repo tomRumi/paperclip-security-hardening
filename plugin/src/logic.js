@@ -1,8 +1,24 @@
 // Pure compliance logic (no SDK imports). Mirrors what host/patches enforce server-side, so drift is visible even if a
 // patch silently stopped applying (the watchdog covers file tampering; this covers the resulting agent configuration).
+import { COMMON_STATE_ENV, isExceptionableType, profileFor } from "./profiles.js";
+
 const DANGEROUS_KEYS = ["dangerouslySkipPermissions", "dangerouslyBypassApprovalsAndSandbox", "dangerouslyBypassSandbox", "yolo", "alwaysApprove", "chrome"];
 
 const plain = (v) => (v && typeof v === "object" && !Array.isArray(v) ? v : {});
+
+/** The adapter types this version boxes through filesystemScope/networkScope; the other scoped types stay refused until a later version. */
+export const BOXED_TYPES = Object.freeze(["claude_local", "opencode_local"]);
+
+/** Names in the agent's stored env that the server drops from every boxed run (HOME and XDG_* everywhere, plus the type's own state redirects). */
+export function envRedirects(type, adapterConfig) {
+  const env = plain(plain(adapterConfig).env);
+  const redirects = new Set([...COMMON_STATE_ENV, ...(profileFor(type)?.stateEnv ?? [])]);
+  return Object.keys(env).filter((k) => redirects.has(k));
+}
+
+/** Does the settings' remoteExceptions list this agent under this type? */
+export const hasRemoteException = (agent, cfg = {}) =>
+  (Array.isArray(cfg.remoteExceptions) ? cfg.remoteExceptions : []).some((e) => e && e.agentId === String(agent?.id) && e.type === String(agent?.adapterType));
 
 /** -> array of finding strings (empty = compliant). */
 export function checkAgent(agent, cfg = {}) {
@@ -14,22 +30,32 @@ export function checkAgent(agent, cfg = {}) {
   if (agent?.status === "terminated") return f;
   if (perms.canCreateAgents === true && !(cfg.canCreateAgentsAllowed ?? []).includes(name)) f.push("canCreateAgents is true");
   if (perms.canCreateSkills === true) f.push("canCreateSkills is true");
-  if (type.endsWith("_local")) {
-    let boxed = false; // claude_local only: every sandbox check below passed
-    if (type === "claude_local") {
+  if (isExceptionableType(type)) {
+    if (!hasRemoteException(agent, cfg)) f.push(`adapter type ${type} runs outside the box and needs a remote exception (an admin lists this agent under remote exceptions in the Security hardening settings); the server refuses to run it`);
+  } else if (!type.endsWith("_local") && !profileFor(type)?.scopes) {
+    if (type) f.push(`adapter type ${type} is not supported and cannot be excepted (the server refuses to run it)`);
+  } else {
+    let boxed = false; // claude_local and opencode_local: every sandbox check below passed
+    if (BOXED_TYPES.includes(type)) {
       const before = f.length;
       if (a.filesystemScope !== "workspace") f.push("filesystemScope is not 'workspace'");
-      if (typeof a.filesystemSandboxCommand !== "string" || !a.filesystemSandboxCommand.startsWith("/")) f.push("filesystemSandboxCommand is not an absolute path");
+      if (typeof a.filesystemSandboxCommand !== "string" || !a.filesystemSandboxCommand.startsWith("/")) f.push("filesystemSandboxCommand is not an absolute path"); // both boxed types: the box helper runs this command, a bare name is looked up on a PATH
+      if (profileFor(type).engineCli && a.engine !== "cli") f.push("engine is not 'cli' (the default engine is not boxed)");
       const open = (cfg.openNetworkAgentNames ?? []).includes(name);
       if (a.networkScope !== "allowlist" && !open) f.push("networkScope is not 'allowlist'");
       if (a.networkScope === "allowlist" && (!Array.isArray(a.networkAllowlist) || a.networkAllowlist.length === 0)) f.push("networkAllowlist is empty");
       if (Array.isArray(a.networkAllowlist) && a.networkAllowlist.some((h) => typeof h !== "string" || h.includes("*") || /REDACTED/i.test(h))) f.push("networkAllowlist contains a wildcard or redacted entry");
       boxed = f.length === before;
+      const dropped = envRedirects(type, a); // does not unbox the agent; the server just ignores them
+      if (dropped.length) f.push(`stored env sets ${dropped.join(", ")}, which the server drops from boxed runs (remove them)`);
     } else if (type === "hermes_local") {
       const want = cfg.hermesWrapperPath ?? "/usr/local/bin/hermes-sandbox";
       if (a.command !== want) f.push("command is not the sandbox wrapper " + want);
+      if (typeof a.hermesCommand === "string" && a.hermesCommand !== "" && a.hermesCommand !== want) f.push("hermesCommand is not the sandbox wrapper " + want);
+    } else if (profileFor(type)?.scopes) {
+      f.push(`adapter type ${type} has no sandbox support in this version (planned for a later version); the server refuses to run it`);
     } else {
-      f.push("adapter type " + type + " has no sandbox support (the fail-closed patch refuses to run it)");
+      f.push(`adapter type ${type} has no sandbox support and cannot be excepted (the server refuses to run it)`);
     }
     // Skip-permissions is the claude_local adapter's headless mode (without it `claude -p` refuses Bash and MCP tools) and
     // its default for an unset key is true. It is acceptable only inside the box above (true or unset); on an unboxed

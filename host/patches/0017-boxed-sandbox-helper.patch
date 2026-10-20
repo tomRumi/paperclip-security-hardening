@@ -1,0 +1,353 @@
+--- a/node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js
++++ b/node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js
+@@ -1,4 +1,5 @@
+ import dns from "node:dns"; // LOCAL-PATCH 0015
++import fsSync from "node:fs"; // LOCAL-PATCH 0017
+ import fs from "node:fs/promises";
+ import http from "node:http";
+ import net from "node:net";
+@@ -315,7 +316,55 @@
+         body,
+     ].join("\r\n");
+ }
+-async function startNetworkAllowlistProxy(allowlist, trustedUrls, socketPath) {
++// LOCAL-PATCH 0017: one structured stderr line per denied proxy target, so the operator (and the watchdog's journal rules)
++// can see which host an agent tried to reach. Fields: event, agentId, runId, host, port. Never a path or query string: the
++// proxy only looks at host:port, and the host is sanitised because the agent chooses it. At most 20 lines per run (a retry
++// loop must not flood the journal); the next denial writes one final line with rateLimited:true, then nothing more.
++const NETWORK_DENIED_EVENT = "sandbox_network_denied";
++const NETWORK_DENIED_LOG_LIMIT = 20;
++const NETWORK_DENIED_RUN_TTL_MS = 60 * 60 * 1000;
++const NETWORK_DENIED_MAX_RUNS = 1000;
++const networkDeniedRuns = new Map();
++function sanitizeNetworkLogId(value) {
++    return typeof value === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(value) ? value : null;
++}
++function createNetworkDeniedLogger(context) {
++    const agentId = sanitizeNetworkLogId(context?.agentId) ?? "unknown";
++    const runId = sanitizeNetworkLogId(context?.runId);
++    let counter = { lines: 0, limited: false, seenAt: Date.now() };
++    if (runId) {
++        const now = Date.now();
++        for (const [key, entry] of networkDeniedRuns) {
++            if (now - entry.seenAt > NETWORK_DENIED_RUN_TTL_MS || networkDeniedRuns.size > NETWORK_DENIED_MAX_RUNS)
++                networkDeniedRuns.delete(key);
++        }
++        counter = networkDeniedRuns.get(runId) ?? counter;
++        networkDeniedRuns.set(runId, counter);
++    }
++    return (hostname, port) => {
++        counter.seenAt = Date.now();
++        let entry;
++        if (counter.lines < NETWORK_DENIED_LOG_LIMIT) {
++            counter.lines += 1;
++            const host = String(hostname).toLowerCase().replace(/^\[|\]$/g, "").slice(0, 255).replace(/[^a-z0-9.:_-]/g, "?") || "?";
++            entry = { event: NETWORK_DENIED_EVENT, agentId, runId: runId ?? "unknown", host, port: /^\d{1,5}$/.test(String(port)) ? Number(port) : 0 };
++        }
++        else if (!counter.limited) {
++            counter.limited = true;
++            entry = { event: NETWORK_DENIED_EVENT, agentId, runId: runId ?? "unknown", rateLimited: true, limit: NETWORK_DENIED_LOG_LIMIT };
++        }
++        else {
++            return;
++        }
++        try {
++            process.stderr.write(`${JSON.stringify(entry)}\n`);
++        }
++        catch {
++            // a closed stderr must never take the proxy down
++        }
++    };
++}
++async function startNetworkAllowlistProxy(allowlist, trustedUrls, socketPath, denyLogContext) {
+     assertUnixSocketPathLength(socketPath);
+     const rules = [
+         ...allowlist.map(parseNetworkAllowlistEntry),
+@@ -324,6 +373,7 @@
+     if (rules.length === 0) {
+         throw new Error('networkScope="allowlist" requires at least one valid networkAllowlist hostname or HTTP(S) networkTrustedUrl.');
+     }
++    const logDenied = createNetworkDeniedLogger(denyLogContext); // LOCAL-PATCH 0017
+     const policyDecision = Symbol("paperclip.localPatch0015.networkDecision"); // LOCAL-PATCH 0015
+     const server = http.createServer(function onProxyRequest(request, response) { // LOCAL-PATCH 0015: named, re-entered once the async policy check is done
+         let target;
+@@ -346,6 +396,7 @@
+                 if (response.destroyed || response.headersSent)
+                     return; // the client left during the lookup
+                 if (!resolved) {
++                    logDenied(target.hostname, port); // LOCAL-PATCH 0017
+                     writeProxyError(response, 403, "network_target_denied", "Network target denied by Paperclip sandbox policy.");
+                     return;
+                 }
+@@ -385,6 +436,7 @@
+             if (clientSocket.destroyed || upstream.destroyed)
+                 return; // the client left during the lookup
+             if (!decision) {
++                logDenied(hostname, port); // LOCAL-PATCH 0017
+                 upstream.destroy();
+                 clientSocket.end(connectProxyError("network_target_denied", "Network target denied by Paperclip sandbox policy."));
+                 return;
+@@ -539,7 +591,7 @@
+             const socketPath = path.join(tempDir, "proxy.sock");
+             const bridgePath = path.join(tempDir, "bridge.cjs");
+             await fs.writeFile(bridgePath, await createNetworkProxyBridge(), { mode: 0o500 });
+-            const proxy = await startNetworkAllowlistProxy(input.options.networkAllowlist ?? [], input.options.networkTrustedUrls ?? [], socketPath).catch(async (error) => {
++            const proxy = await startNetworkAllowlistProxy(input.options.networkAllowlist ?? [], input.options.networkTrustedUrls ?? [], socketPath, input.options.networkDenyLog).catch(async (error) => {
+                 await fs.rm(tempDir, { recursive: true, force: true });
+                 throw error;
+             });
+@@ -559,7 +611,7 @@
+             const socketPath = path.join(tempDir, "proxy.sock");
+             const bridgePath = path.join(tempDir, "bridge.cjs");
+             await fs.writeFile(bridgePath, await createNetworkProxyBridge(), { mode: 0o500 });
+-            const proxy = await startNetworkAllowlistProxy(input.options.networkAllowlist ?? [], input.options.networkTrustedUrls ?? [], socketPath).catch(async (error) => {
++            const proxy = await startNetworkAllowlistProxy(input.options.networkAllowlist ?? [], input.options.networkTrustedUrls ?? [], socketPath, input.options.networkDenyLog).catch(async (error) => {
+                 await fs.rm(tempDir, { recursive: true, force: true });
+                 throw error;
+             });
+@@ -610,4 +662,244 @@
+         return { path: normalizeAbsolutePath(raw.path, `filesystemExtraPaths[${index}].path`), access };
+     });
+ }
++// LOCAL-PATCH 0017: the shared entry point for boxing every local adapter (see the patches 0018 and up). An adapter calls
++// registerBoxedAdapter(type) when it loads, ensureBoxedRuntimeDir(dir) before a run and passes boxedSandboxOptions(...) as
++// `localProcessSandbox` to the spawn call. The spawn-time admission (0005f) only lets a type run when it registered.
++/** Adapter types whose stored config must say engine "cli": their default engine is an ACP lane the box cannot reach. */
++export const ENGINE_CLI_TYPES = Object.freeze(["claude_local", "codex_local", "gemini_local", "kimi_local"]);
++/** Every adapter type that can run in this box; registerBoxedAdapter accepts nothing else. */
++export const BOXED_ADAPTER_TYPES = Object.freeze(["claude_local", "codex_local", "opencode_local", "gemini_local", "cursor", "pi_local", "kimi_local", "grok_local"]);
++/** The only variable names a boxed child keeps from the server's own environment (the env scrub, patch 0025, uses this list
++ *  too, next to the names of the adapter's own env object). HOME is the box home; the proxy names are what the box sets. */
++export const BASE_ENV_ALLOW = Object.freeze([
++    "PATH", "HOME", "LANG", "LANGUAGE", "TZ", "TERM",
++    "LC_ALL", "LC_CTYPE", "LC_COLLATE", "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME", "LC_PAPER", "LC_NAME",
++    "LC_ADDRESS", "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION",
++    ...PROXY_ENV_KEYS, "NO_PROXY", "no_proxy",
++]);
++const BOXED_ADAPTERS_KEY = Symbol.for("paperclip.hardening.boxedAdapters");
++const WORKSPACE_ROOTS_KEY = Symbol.for("paperclip.hardening.workspaceRoots");
++// The registry of boxed adapter types: a frozen { has, add } defined ONCE on globalThis (not writable, not configurable), so no
++// other code in the server process can swap it for a set that says yes to everything or empty it. add() takes only the known types.
++if (!Object.getOwnPropertyDescriptor(globalThis, BOXED_ADAPTERS_KEY)) {
++    const registered = new Set();
++    Object.defineProperty(globalThis, BOXED_ADAPTERS_KEY, {
++        value: Object.freeze({
++            has: (type) => typeof type === "string" && registered.has(type),
++            add: (type) => {
++                if (!BOXED_ADAPTER_TYPES.includes(type))
++                    throw new Error(`registerBoxedAdapter: "${String(type)}" is not an adapter type that can run in the box.`);
++                registered.add(type);
++                return type;
++            },
++        }),
++        writable: false, configurable: false, enumerable: false,
++    });
++}
++/** Record that this process runs `type` through the box. Returns the type. */
++export function registerBoxedAdapter(type) {
++    if (typeof type !== "string" || !/^[a-z][a-z0-9_]*$/.test(type)) {
++        throw new Error("registerBoxedAdapter requires an adapter type such as \"codex_local\".");
++    }
++    const registry = globalThis[BOXED_ADAPTERS_KEY];
++    if (typeof registry?.add !== "function")
++        throw new Error("registerBoxedAdapter: the boxed adapter registry is not available.");
++    return registry.add(type);
++}
++/** Create <dir>, <dir>/home and <dir>/state (mode 0700, owned by this user, never a symlink). Returns their paths. */
++export async function ensureBoxedRuntimeDir(runtimeDir) {
++    const dir = normalizeAbsolutePath(String(runtimeDir ?? ""), "Boxed runtime dir");
++    const homeDir = path.join(dir, "home");
++    const stateDir = path.join(dir, "state");
++    await fs.mkdir(homeDir, { recursive: true, mode: 0o700 });
++    await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
++    for (const candidate of [dir, homeDir, stateDir]) {
++        const stat = await fs.lstat(candidate);
++        if (!stat.isDirectory())
++            throw new Error(`Boxed runtime path "${candidate}" must be a real directory, not a symlink.`);
++        if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
++            throw new Error(`Boxed runtime path "${candidate}" is not owned by the user running Paperclip.`);
++        }
++        await fs.chmod(candidate, 0o700);
++    }
++    return { dir, homeDir, stateDir };
++}
++// Where a path may lie when it is inside the instance directory (<PAPERCLIP_HOME>/instances/<id>, wherever it is) or inside the home
++// directory of the user running Paperclip: below the instance's workspaces or projects directory, below THIS agent's own
++// companies/<companyId>/agents/<agentId> directory, or below a workspace root (the roots patch 0003b publishes, else
++// $PAPERCLIP_SANDBOX_WORKSPACE_ROOT). Anything else in the instance (db, secrets, logs, config, other companies and agents) or in the
++// home (~/.ssh, ~/.aws) is never mounted, and neither is a parent of the home or of the instance. A READ-ONLY mount is looser inside
++// the home: anything except the credential and state locations of readOnlyHomeDenied (the instance rule stays, plus its skills directory). The instance is guarded on its
++// own, so PAPERCLIP_HOME outside the home protects the same. Every path is resolved through symlinks first (the nearest existing
++// ancestor when it is not created yet), so a link cannot lead there.
++function realPathLoose(candidate) {
++    let current = path.resolve(candidate);
++    const tail = [];
++    for (;;) {
++        try {
++            return path.join(fsSync.realpathSync(current), ...tail.reverse());
++        }
++        catch (error) {
++            if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR")
++                throw error;
++            let isLink = false;
++            try {
++                isLink = fsSync.lstatSync(current).isSymbolicLink();
++            }
++            catch { /* missing */ }
++            if (isLink)
++                throw new Error(`"${current}" is a dangling symbolic link.`);
++            const parent = path.dirname(current);
++            if (parent === current)
++                throw error;
++            tail.push(path.basename(current));
++            current = parent;
++        }
++    }
++}
++function isInsidePath(parent, child) {
++    const relative = path.relative(parent, child);
++    return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
++}
++function realHomeDirs() {
++    return [...new Set([os.homedir(), process.env.HOME]
++        .filter((home) => typeof home === "string" && path.isAbsolute(home))
++        .map((home) => realPathLoose(home)))];
++}
++function instanceRootForBox() {
++    const homeRaw = process.env.PAPERCLIP_HOME?.trim();
++    const homeDir = path.resolve(homeRaw ? (homeRaw === "~" ? os.homedir() : homeRaw.startsWith("~/") ? path.resolve(os.homedir(), homeRaw.slice(2)) : homeRaw) : path.resolve(os.homedir(), ".paperclip"));
++    const instanceId = process.env.PAPERCLIP_INSTANCE_ID?.trim() || "default";
++    if (!/^[a-zA-Z0-9_-]+$/.test(instanceId))
++        throw new Error(`Invalid PAPERCLIP_INSTANCE_ID '${instanceId}'.`);
++    return path.resolve(homeDir, "instances", instanceId);
++}
++const BOXED_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
++function boxedAllowedRoots(homes, instanceRoot, ids, access) {
++    const published = globalThis[WORKSPACE_ROOTS_KEY];
++    const configured = Array.isArray(published) ? published : String(process.env.PAPERCLIP_SANDBOX_WORKSPACE_ROOT ?? "").split(path.delimiter);
++    const instanceDirs = ["workspaces", "projects"].map((dir) => path.join(instanceRoot, dir));
++    const workspaceRoots = configured
++        .filter((root) => typeof root === "string" && path.isAbsolute(root))
++        .map((root) => realPathLoose(root))
++        // a root that holds the home or the whole instance would open everything below it: not a workspace root
++        .filter((root) => !homes.some((home) => isInsidePath(root, home)) && !isInsidePath(root, instanceRoot))
++        // and a root inside the instance must lie in its workspaces or projects directory (not on db, secrets or other agents)
++        .filter((root) => !isInsidePath(instanceRoot, root) || instanceDirs.some((dir) => isInsidePath(dir, root)));
++    const ownAgentDir = BOXED_ID_PATTERN.test(String(ids?.companyId ?? "")) && BOXED_ID_PATTERN.test(String(ids?.agentId ?? ""))
++        ? [path.join(instanceRoot, "companies", ids.companyId, "agents", ids.agentId)] : [];
++    // read-only, never writable: the server-managed Claude prompt cache (instructions file, skill links) of THIS agent's company; the
++    // other companies' caches and every other directory under companies/ stay out
++    const ownPromptCache = access === "ro" && BOXED_ID_PATTERN.test(String(ids?.companyId ?? ""))
++        ? [path.join(instanceRoot, "companies", ids.companyId, "claude-prompt-cache")] : [];
++    // read-only only: the instance's skills directory (server-managed skill catalogs the board attaches to agents)
++    const skillsDir = access === "ro" ? [path.join(instanceRoot, "skills")] : [];
++    return [...ownAgentDir, ...instanceDirs, ...workspaceRoots, ...ownPromptCache, ...skillsDir];
++}
++// What a read-only mount may not show, relative to the home of the user running Paperclip: the SSH, GPG, cloud and registry credentials,
++// the board's tokens (.config/paperclip-*), Paperclip's own state (.local/state), the user's Claude credentials, and any directory
++// that holds one of those (.config and .local themselves). The home directory and its parents are refused before this.
++function readOnlyHomeDenied(relative) {
++    const [first, second] = relative.split(path.sep);
++    if ([".ssh", ".gnupg", ".aws", ".docker", ".npmrc", ".netrc", ".claude", ".claude.json"].includes(first))
++        return true;
++    if (first === ".config")
++        return second === undefined || second === "gcloud" || second.startsWith("paperclip-");
++    return first === ".local" && (second === undefined || second === "state");
++}
++function assertBoxedPathAllowed(label, candidate, ids, access = "rw") {
++    const real = realPathLoose(candidate);
++    const homes = realHomeDirs();
++    const instanceRoot = realPathLoose(instanceRootForBox());
++    if (homes.some((home) => isInsidePath(real, home)))
++        throw new Error(`${label}: refusing to mount "${candidate}", it contains the home directory of the user running Paperclip.`);
++    const inHome = homes.some((home) => isInsidePath(home, real));
++    const inInstance = isInsidePath(instanceRoot, real) || isInsidePath(real, instanceRoot); // inside the instance, or a parent of it
++    if (access === "ro") {
++        // Read-only mounts (the board sets the extra paths; an agent cannot change them, patch 0002) are allowed anywhere except the
++        // instance (only the places listed in boxedAllowedRoots) and the home's credential and state locations (readOnlyHomeDenied).
++        const denied = homes.some((home) => isInsidePath(home, real) && readOnlyHomeDenied(path.relative(home, real)));
++        if (!denied && (!inInstance || boxedAllowedRoots(homes, instanceRoot, ids, access).some((root) => isInsidePath(root, real))))
++            return;
++        throw new Error(`${label}: refusing to mount "${candidate}"${real === candidate ? "" : ` (resolves to "${real}")`} read-only, it is ${denied ? "a credential or state location in the home directory of the user running Paperclip (or contains one)" : `inside, or a parent of, the Paperclip instance directory "${instanceRoot}"`} `
++            + "and not one of the instance's workspaces, projects or skills directories, this agent's own companies/<company>/agents/<agent> directory, a workspace root or its company's claude-prompt-cache.");
++    }
++    if (!inHome && !inInstance)
++        return;
++    if (boxedAllowedRoots(homes, instanceRoot, ids, access).some((root) => isInsidePath(root, real)))
++        return;
++    throw new Error(`${label}: refusing to mount "${candidate}"${real === candidate ? "" : ` (resolves to "${real}")`}, it is ${inHome ? "inside the home directory of the user running Paperclip" : `inside, or a parent of, the Paperclip instance directory "${instanceRoot}"`} `
++        + "and not inside the instance's workspaces or projects directory, this agent's own companies/<company>/agents/<agent> directory, a workspace root or (read-only) its company's claude-prompt-cache.");
++}
++/**
++ * The `localProcessSandbox` option object for one run of a boxed adapter, or null when the agent has no filesystem or
++ * network scope or runs on a remote target. The child's HOME is <runtimeDir>/home, the only writable paths are the
++ * workspace, the runtime dir and `managedRw`; the home directory of the user running Paperclip (or a parent of it) and the instance
++ * directory (or a parent of it) are never mounted, except this agent's own companies/<c>/agents/<a> directory, the instance's
++ * workspaces and projects directories and the workspace roots; read-only (managedRo, a "ro" extra path) also this agent's company's
++ * claude-prompt-cache directory.
++ *   type, config, env   adapter type, adapter config (scopes, allowlist, extra paths, sandbox command), the adapter's OWN env
++ *                       object: the variables it built for this run (its names become `envPassNames`, the only extra
++ *                       variables the env scrub lets through). It must never be process.env or a spread of it. The names are
++ *                       read when this function is called: an adapter that adds variables to `env` afterwards (a workspace refresh,
++ *                       a late run variable) sets `options.envPassNames = Object.keys(env)` again right before the spawn.
++ *   workspaceDir        the run's working directory;  runtimeDir  <instance>/companies/<c>/agents/<a>/<key>-runtime
++ *   managedRw/Ro        more paths to mount (strings)
++ *   trustedUrls         the URLs the proxy lets through besides the allowlist: the Paperclip API URL and the runtime-tools
++ *                       endpoints, as the ADAPTER computed them (buildPaperclipEnv / buildRuntimeToolsEnv). Nothing is
++ *                       taken from `env`: it also holds config.env entries, which the agent (or a run-level override) controls.
++ *   remoteTarget        true when the run executes on a remote execution target (no local box then)
++ *   agentId, companyId  whose box this is: the only <instance>/companies/<companyId>/agents/<agentId> directory that may be mounted; default to
++ *                       env.PAPERCLIP_AGENT_ID / env.PAPERCLIP_COMPANY_ID (without them nothing under companies/ can be mounted)
++ *   runId               for the denied-network log; defaults to env.PAPERCLIP_RUN_ID (agentId also goes to the log)
++ */
++export function boxedSandboxOptions(input) {
++    const { type, config = {}, env = {}, workspaceDir, runtimeDir, managedRw = [], managedRo = [], trustedUrls = [], pathAliases = [], outboundRestorePaths = [], remoteTarget = false } = input ?? {};
++    const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
++    const networkScope = parseLocalProcessNetworkScope(config.networkScope);
++    if ((!filesystemScope && !networkScope) || remoteTarget)
++        return null;
++    const label = `Boxed ${type ?? "adapter"}`;
++    // whose box this is: the input, else the adapter's own PAPERCLIP_ ids (buildPaperclipEnv); the mounts under companies/ are limited to it
++    const ids = { agentId: input.agentId ?? env.PAPERCLIP_AGENT_ID, companyId: input.companyId ?? env.PAPERCLIP_COMPANY_ID };
++    const workspace = normalizeAbsolutePath(String(workspaceDir ?? ""), `${label} workspaceDir`);
++    const runtime = filesystemScope ? normalizeAbsolutePath(String(runtimeDir ?? ""), `${label} runtimeDir`) : null;
++    const managedPaths = [];
++    const extraPaths = parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths);
++    if (runtime) {
++        managedPaths.push({ path: runtime, access: "rw" });
++        for (const candidate of managedRw)
++            managedPaths.push({ path: normalizeAbsolutePath(String(candidate), `${label} managedRw path`), access: "rw" });
++        for (const candidate of managedRo)
++            managedPaths.push({ path: normalizeAbsolutePath(String(candidate), `${label} managedRo path`), access: "ro" });
++        for (const entry of [{ path: workspace, access: "rw" }, ...managedPaths, ...extraPaths])
++            assertBoxedPathAllowed(label, entry.path, ids, entry.access === "ro" ? "ro" : "rw");
++    }
++    const trusted = trustedUrls
++        .filter((value, index, all) => typeof value === "string" && value.length > 0 && all.indexOf(value) === index);
++    for (const url of trusted) {
++        let protocol = "";
++        try {
++            protocol = new URL(url).protocol;
++        }
++        catch { /* rejected below */ }
++        if (protocol !== "http:" && protocol !== "https:")
++            throw new Error(`${label}: trustedUrls entry "${url}" is not an http(s) URL.`);
++    }
++    return {
++        workspaceDir: workspace,
++        filesystemScope,
++        managedPaths,
++        extraPaths,
++        pathAliases,
++        outboundRestorePaths,
++        homeDir: runtime ? path.join(runtime, "home") : null,
++        networkScope,
++        networkAllowlist: parseLocalProcessNetworkAllowlist(config.networkAllowlist),
++        networkTrustedUrls: trusted,
++        command: typeof config.filesystemSandboxCommand === "string" && config.filesystemSandboxCommand.trim() ? config.filesystemSandboxCommand.trim() : "bwrap",
++        envPassNames: Object.keys(env),
++        networkDenyLog: { agentId: input.agentId ?? env.PAPERCLIP_AGENT_ID, runId: input.runId ?? env.PAPERCLIP_RUN_ID },
++    };
++}
+ //# sourceMappingURL=local-process-sandbox.js.map
+\ No newline at end of file

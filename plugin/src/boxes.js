@@ -19,7 +19,8 @@
 // when the box is edited and flagged on the row when the grant came from elsewhere.
 import { validHost, validPath } from "./settings.js";
 import { NotAllowedError } from "./hardening.js";
-import { listAgents } from "./logic.js";
+import { BOXED_TYPES, checkAgent, envRedirects, hasRemoteException, listAgents } from "./logic.js";
+import { defaultHostsFor, isExceptionableType, profileFor } from "./profiles.js";
 import { PLUGIN_ID } from "./manifest.js";
 
 export const PUBLIC_WEB = Object.freeze(["*:443", "*:80"]);
@@ -28,7 +29,7 @@ export const DEFAULT_BASE_ALLOWLIST = Object.freeze(["api.anthropic.com"]);
 export const REDACTED = "***REDACTED***";
 const REDACTED_RE = /REDACTED/i;
 export const BOXES_KEY = (companyId) => ({ scopeKind: "company", scopeId: String(companyId), stateKey: "agent-boxes" });
-const BOXED_TYPE = "claude_local";
+const isBoxed = (type) => BOXED_TYPES.includes(type);
 const MAX_LIST = 64;
 export const APPLY_UNSUPPORTED =
   "Not applied: this Paperclip's plugin SDK has no capability to change an agent's adapter configuration. Apply the PATCH shown (board UI or API); the plugin keeps these values as the source of truth.";
@@ -48,8 +49,24 @@ export function assertNoRedacted(value, where = "body") {
   return value;
 }
 
+/**
+ * Where an agent's adapter type stands in this version: boxed (claude_local, opencode_local), hermes-wrapper,
+ * exception-needed / excepted (remote and generic types: refused unless listed under remote exceptions), later-version
+ * (the other local types: planned) or unsupported (anything else: always refused).
+ */
+export function typeState(agent, cfg = {}) {
+  const type = String(agent?.adapterType ?? "");
+  if (isBoxed(type)) return { state: "boxed", note: null };
+  if (type === "hermes_local") return { state: "hermes-wrapper", note: null };
+  if (isExceptionableType(type))
+    return hasRemoteException(agent, cfg) ? { state: "excepted", note: "runs outside the box under a remote exception" } : { state: "exception-needed", note: "needs a remote exception" };
+  if (profileFor(type)?.scopes) return { state: "later-version", note: "planned for a later version; the server refuses to run it" };
+  return { state: "unsupported", note: "not supported; the server refuses to run it" };
+}
+
 /** Open web: no network scope (host network) or a public-web wildcard entry. */
-export function currentBox(agent, { hermesWrapperPath = "" } = {}) {
+export function currentBox(agent, { hermesWrapperPath = "", remoteExceptions = [] } = {}) {
+  const site = { remoteExceptions };
   const type = String(agent?.adapterType ?? "");
   const cfg = plain(agent?.adapterConfig);
   if (type === "hermes_local") {
@@ -57,7 +74,10 @@ export function currentBox(agent, { hermesWrapperPath = "" } = {}) {
     return cfg.command === want ? { kind: "hermes-wrapper", hosts: [], hiddenHosts: 0, paths: [], hiddenPaths: 0, red: false }
       : { kind: "none", hosts: [], hiddenHosts: 0, paths: [], hiddenPaths: 0, red: true, note: "Hermes without the sandbox wrapper" };
   }
-  if (type !== BOXED_TYPE) return { kind: "unsupported", hosts: [], hiddenHosts: 0, paths: [], hiddenPaths: 0, red: true, note: `${type || "this adapter"} has no sandbox support` };
+  if (!isBoxed(type)) {
+    const t = typeState(agent, site);
+    return { kind: "unsupported", hosts: [], hiddenHosts: 0, paths: [], hiddenPaths: 0, red: t.state !== "excepted", note: `${type || "this adapter"}: ${t.note}` };
+  }
   const list = Array.isArray(cfg.networkAllowlist) ? cfg.networkAllowlist : [];
   const plist = Array.isArray(cfg.filesystemExtraPaths) ? cfg.filesystemExtraPaths : [];
   const hosts = list.filter((h) => !isHidden(h));
@@ -67,6 +87,27 @@ export function currentBox(agent, { hermesWrapperPath = "" } = {}) {
   if (hosts.some((h) => h.startsWith("*:"))) return { ...base, kind: "public-web", red: false };
   if (base.hiddenHosts) return { ...base, kind: "hidden", red: false, note: `${base.hiddenHosts} host(s) hidden by Paperclip` };
   return { ...base, kind: "allowlist", red: false };
+}
+
+/**
+ * The PATCH body that brings a boxable agent's stored config to what the server admits: only the keys that are wrong
+ * (null when none is). The allowlist comes from `hosts` (the plugin's lists), never from what Paperclip returned.
+ * Env redirects the server drops are listed by name, not rebuilt: the stored env cannot be read back safely.
+ */
+export function fixBody(agent, hosts) {
+  const type = String(agent?.adapterType ?? "");
+  if (!isBoxed(type)) return null;
+  const a = plain(agent.adapterConfig);
+  const fix = {};
+  if (a.filesystemScope !== "workspace") fix.filesystemScope = "workspace";
+  if (typeof a.filesystemSandboxCommand !== "string" || !a.filesystemSandboxCommand.startsWith("/")) fix.filesystemSandboxCommand = "/usr/bin/bwrap"; // both boxed types: the box helper runs this command
+  if (profileFor(type).engineCli && a.engine !== "cli") fix.engine = "cli";
+  const list = Array.isArray(a.networkAllowlist) ? a.networkAllowlist : null;
+  if (a.networkScope !== "allowlist" || !list || !list.length || list.some((h) => !isHidden(h) && h.includes("*"))) {
+    fix.networkScope = "allowlist";
+    fix.networkAllowlist = hosts;
+  }
+  return Object.keys(fix).length ? assertNoRedacted({ adapterConfig: fix }, "fix PATCH") : null;
 }
 
 /** Grant rows (authorization.grants.list) -> {agentId: Set(permissionKey)}; null when grants could not be read. */
@@ -119,8 +160,10 @@ export function normalizeBoxInput(input = {}) {
   return { box: { mode: mode ?? "allowlist", extraHosts, extraPaths }, errors };
 }
 
-export function effectiveBase(settings = {}) {
-  const hosts = Array.isArray(settings.baseAllowlist) && settings.baseAllowlist.length ? settings.baseAllowlist : DEFAULT_BASE_ALLOWLIST;
+/** The base lists a new agent of the type starts with: claude_local keeps `baseAllowlist`, the other boxed types use `baseAllowlists[type]`, then the profile's default hosts. */
+export function effectiveBase(settings = {}, type = "claude_local") {
+  const own = type === "claude_local" ? settings.baseAllowlist : settings.baseAllowlists?.[type];
+  const hosts = Array.isArray(own) && own.length ? own : type === "claude_local" ? DEFAULT_BASE_ALLOWLIST : defaultHostsFor(type);
   const paths = Array.isArray(settings.extraReadOnlyPaths) ? settings.extraReadOnlyPaths : [];
   return { hosts: [...hosts], paths: [...paths] };
 }
@@ -129,10 +172,10 @@ export function effectiveBase(settings = {}) {
  * The PATCH body for an agent's box: full lists from the plugin's stored settings plus the base settings. Never built
  * from a value Paperclip returned; checked for redacted placeholders before it leaves this function.
  */
-export function buildBoxPatch(stored, settings) {
+export function buildBoxPatch(stored, settings, type = "claude_local") {
   const { box, errors } = normalizeBoxInput(stored);
   if (errors.length) throw new Error(`stored box settings are invalid: ${errors.join("; ")}`);
-  const base = effectiveBase(settings);
+  const base = effectiveBase(settings, type);
   const networkAllowlist = dedupe([...base.hosts, ...box.extraHosts, ...(box.mode === "public-web" ? PUBLIC_WEB : [])]);
   const filesystemExtraPaths = dedupe([...base.paths, ...box.extraPaths]);
   return assertNoRedacted({ adapterConfig: { networkScope: "allowlist", networkAllowlist, filesystemExtraPaths } }, "box PATCH");
@@ -141,7 +184,7 @@ export function buildBoxPatch(stored, settings) {
 /** Plugin-side settings taken from an agent's current state (only what is visible; redacted entries are lost). */
 export function takeOverFrom(agent, settings) {
   const cur = currentBox(agent);
-  const base = effectiveBase(settings);
+  const base = effectiveBase(settings, String(agent?.adapterType));
   const notes = [];
   const extraHosts = cur.hosts.filter((h) => !h.startsWith("*:") && !base.hosts.includes(h));
   const badHosts = extraHosts.filter((h) => !validHost(h));
@@ -224,25 +267,36 @@ export function createBoxes({ ctx, assertAdmin, loadSettings, applyBox = null, c
     catch (e) { log.warn(`activity log entry not written: ${e.message}`); }
   }
 
-  function row(agent, { stored, grants, settings, caps }) {
-    const cur = currentBox(agent, { hermesWrapperPath: settings.hermesWrapperPath });
+  function row(agent, { stored, grants, settings, caps, company }) {
+    const cur = currentBox(agent, { hermesWrapperPath: settings.hermesWrapperPath, remoteExceptions: settings.remoteExceptions });
+    const type = String(agent.adapterType ?? "");
     const perms = permissionsOf(agent, grants);
     const mine = stored[agent.id] ?? null;
     const cfg = plain(agent.adapterConfig);
     let patch = null, sync = null, error = null;
     if (mine) {
-      try { patch = buildBoxPatch(mine, settings); sync = syncState(agent, patch); } catch (e) { error = e.message; }
+      try { patch = buildBoxPatch(mine, settings, type); sync = syncState(agent, patch); } catch (e) { error = e.message; }
     }
     const publicWeb = mine ? mine.mode === "public-web" : cur.kind === "public-web";
     const conflicts = [];
     if (publicWeb && perms.tasksAssign === true) conflicts.push("public web AND tasks:assign (XOR rule)");
     else if (publicWeb && perms.tasksAssign === "derived") conflicts.push("public web AND assign rights derived from role/canCreateAgents");
     if (cur.kind === "public-web" && !publicWeb) conflicts.push("Paperclip has public web, the plugin's box does not");
-    const base = effectiveBase(settings);
+    const base = effectiveBase(settings, type);
+    const state = typeState(agent, settings);
+    // Paperclip returns allowlist hosts redacted; the page shows those as "hidden", so only a real wildcard is a finding here.
+    const list = Array.isArray(cfg.networkAllowlist) ? cfg.networkAllowlist : [];
+    const wildcard = list.some((h) => !isHidden(h) && h.includes("*"));
+    const findings = checkAgent(agent, { ...company, remoteExceptions: settings.remoteExceptions, ...(settings.hermesWrapperPath ? { hermesWrapperPath: settings.hermesWrapperPath } : {}) })
+      .filter((f) => wildcard || !/wildcard or redacted/.test(f));
+    const fix = fixBody(agent, mine && patch ? patch.adapterConfig.networkAllowlist : base.hosts);
     return {
       id: String(agent.id), name: String(agent.name ?? ""), role: agent.role ?? null, status: String(agent.status ?? ""),
       adapterType: String(agent.adapterType ?? ""), model: typeof cfg.model === "string" ? cfg.model : "",
-      boxable: agent.adapterType === BOXED_TYPE,
+      boxable: isBoxed(type),
+      typeState: state.state, typeNote: state.note,
+      findings,
+      fix, dropEnv: isBoxed(type) ? envRedirects(type, cfg) : [],
       current: cur,
       managed: Boolean(mine),
       plugin: mine ? { mode: mine.mode, extraHosts: mine.extraHosts, extraPaths: mine.extraPaths, updatedAt: mine.updatedAt ?? null, updatedBy: mine.updatedBy ?? null } : null,
@@ -263,8 +317,9 @@ export function createBoxes({ ctx, assertAdmin, loadSettings, applyBox = null, c
     /** Rows for one company (fresh from Paperclip). Read gate: see resolveTarget. */
     async view(params = {}, context) {
       const { companyId } = await resolveTarget(assertAdmin, params, context);
-      const [agents, grants, stored, settings] = await Promise.all([
+      const [agents, grants, stored, settings, company] = await Promise.all([
         listAgents(ctx, companyId), readGrants(companyId), loadStored(companyId), loadSettings().catch(() => ({})),
+        Promise.resolve(ctx.config?.get?.(companyId)).then((c) => plain(c), () => ({})),
       ]);
       const live = agents.filter((a) => a.status !== "terminated");
       const caps = capsView ? await capsView(companyId, live).catch((e) => { log.warn(`caps view failed: ${e.message}`); return null; }) : null;
@@ -273,7 +328,7 @@ export function createBoxes({ ctx, assertAdmin, loadSettings, applyBox = null, c
       return {
         companyId, checkedAt: new Date().toISOString(), canEdit, grantsReadable: grants !== null,
         applySupported: typeof applyBox === "function", applyNote: typeof applyBox === "function" ? null : APPLY_UNSUPPORTED,
-        rows: live.map((a) => row(a, { stored, grants, settings, caps: caps?.agents ?? null })),
+        rows: live.map((a) => row(a, { stored, grants, settings, caps: caps?.agents ?? null, company })),
         caps: caps ? { ...caps, agents: undefined } : null,
       };
     },
@@ -283,7 +338,7 @@ export function createBoxes({ ctx, assertAdmin, loadSettings, applyBox = null, c
       return exclusive(async () => {
         const { actor, companyId } = await resolveTarget(assertAdmin, params, context, { write: true });
         const agent = await findAgent(companyId, params.agentId);
-        if (agent.adapterType !== BOXED_TYPE) return { ok: false, error: `${agent.adapterType} agents have no box the plugin can manage` };
+        if (!isBoxed(agent.adapterType)) return { ok: false, error: `${agent.adapterType} agents have no box the plugin can manage` };
         const stored = await loadStored(companyId);
         if (stored[agent.id]) return { ok: false, error: "this agent's box is already managed by the plugin" };
         const settings = await loadSettings();
@@ -303,7 +358,7 @@ export function createBoxes({ ctx, assertAdmin, loadSettings, applyBox = null, c
       return exclusive(async () => {
         const { actor, companyId } = await resolveTarget(assertAdmin, params, context, { write: true });
         const agent = await findAgent(companyId, params.agentId);
-        if (agent.adapterType !== BOXED_TYPE) return { ok: false, error: `${agent.adapterType} agents have no box the plugin can manage` };
+        if (!isBoxed(agent.adapterType)) return { ok: false, error: `${agent.adapterType} agents have no box the plugin can manage` };
         const stored = await loadStored(companyId);
         if (!stored[agent.id]) return { ok: false, error: "take this agent over first (its current state becomes the plugin's settings)" };
         const { box, errors } = normalizeBoxInput(params);
@@ -316,7 +371,7 @@ export function createBoxes({ ctx, assertAdmin, loadSettings, applyBox = null, c
               : `public web refused: ${agent.name} ${perms.tasksAssign === true ? "holds tasks:assign" : "may assign work (CEO role or canCreateAgents)"}; an agent may have public web or assign work, never both` };
         }
         const settings = await loadSettings();
-        const patch = buildBoxPatch(box, settings);
+        const patch = buildBoxPatch(box, settings, agent.adapterType);
         stored[agent.id] = { ...box, updatedAt: new Date().toISOString(), updatedBy: actor.userId };
         await ctx.state.set(BOXES_KEY(companyId), stored);
         let applied = false, applyError = null;

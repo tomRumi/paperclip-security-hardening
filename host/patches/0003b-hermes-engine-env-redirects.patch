@@ -1,0 +1,103 @@
+--- a/node_modules/@paperclipai/server/dist/services/heartbeat.js
++++ b/node_modules/@paperclipai/server/dist/services/heartbeat.js
+@@ -686,6 +686,8 @@
+     "acpNonInteractivePermissions", "codexPermissionMode", "opencodePermissionMode", "acpxPermissionMode", "chrome",
+     "instructionsFilePath", "instructionsRootPath", "instructionsEntryFile", "instructionsBundleMode", "workspaceStrategy",
+     "stateDir", "acpStateDir", "mcpConfigPath",
++    // LOCAL-PATCH 0003b: a run-level engine ("acp") must not move a boxed agent to the lane that never sees the sandbox.
++    "engine",
+ ];
+ // The settings file is trusted for allowlists and read-only paths, so it is used only when no agent run can have written it.
+ // Its real path must not lie inside <instance root>/workspaces, /projects or /companies (the adapters bind the workspace and
+@@ -786,6 +788,51 @@
+     ? HARDENING_CONFIG_0003.workspaceRoots.filter((root) => typeof root === "string").join(path.delimiter)
+     : process.env.PAPERCLIP_SANDBOX_WORKSPACE_ROOT || ["workspaces", "projects"].map((dir) => path.join(hardeningInstanceRoot(), dir)).join(path.delimiter));
+ const SANDBOX_SYSTEM_PATH_DIRS = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/snap"];
++// LOCAL-PATCH 0003b: more enforcement for the other local CLIs and for Hermes. A Hermes agent is covered when its STORED
++// command is the sandbox wrapper (hardening settings `hermesWrapperPath`, as patch 0005a writes it); it has no filesystemScope.
++// The env names below move a CLI's home, config or provider routing; a run-level value (issue, project, routine or
++// environment env) is dropped unless it equals the stored plain value. The server's own per-run credential home (managedAi) is
++// the one thing that legitimately sets some of them: exactly the names managedAiHomeEnvironment() of the server sets (below), and
++// only those, are exempt in a managed run, like CLAUDE_CONFIG_DIR above. Any other state or provider-routing name stays dropped there too.
++// OPENCODE_AUTH_JSON is a credential and not a redirect: it stays out of the rule.
++// PAPERCLIP_API_URL and PAPERCLIP_RUNTIME_TOOLS_* are dropped too (see sandboxIsApiEndpointEnv0003B).
++const SANDBOX_HERMES_WRAPPER_0003B = typeof HARDENING_CONFIG_0003.hermesWrapperPath === "string" && HARDENING_CONFIG_0003.hermesWrapperPath.startsWith("/")
++    ? HARDENING_CONFIG_0003.hermesWrapperPath : "/usr/local/bin/hermes-sandbox";
++// A state or config directory comes from the agent's own box (the adapter sets it under the agent's runtime directory), never from
++// the config or a run, so every one of them is dropped here (CLAUDE_CONFIG_DIR, CODEX_HOME and GROK_HOME by sandboxEnvDropReason).
++// Patch 0005a removes the same names from a new agent; a test builds its name list from the plugin's profile table (stateEnv).
++const SANDBOX_MANAGED_AI_HOME_ENV_0003B = new Set(["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "CODEX_HOME", "GROK_HOME", "CLAUDE_CONFIG_DIR"]);
++const SANDBOX_STATE_REDIRECT_ENV_0003B = new Set(["HOME", "HERMES_HOME", "GEMINI_CLI_HOME", "PI_CODING_AGENT_DIR", "KIMI_CODE_HOME", "CURSOR_HOME", "CURSOR_DATA_DIR"]);
++function sandboxIsStateRedirectEnv0003B(key) {
++    return SANDBOX_STATE_REDIRECT_ENV_0003B.has(key) || /^XDG_/.test(key) || (/^OPENCODE_/.test(key) && key !== "OPENCODE_AUTH_JSON") || /^NODE_/.test(key) || key === "PAPERCLIP_ADAPTER_UTILS" ||
++        /^PAPERCLIP_[A-Z0-9_]+_PROVIDERS$/.test(key);
++}
++// The Paperclip API URL and the runtime-tools endpoints are computed by the adapter for each run; a config.env entry of the same
++// name overrides them, and the box lets those endpoints through its network proxy, so a run-level value is dropped too.
++function sandboxIsApiEndpointEnv0003B(key) {
++    return key === "PAPERCLIP_API_URL" || /^PAPERCLIP_RUNTIME_TOOLS_/.test(key);
++}
++// The workspace roots as this server enforces them, published for the box helper of patch 0017 (adapter-utils), which mounts
++// nothing inside the home directory outside the instance's own directories and these roots. Defined once, frozen, not writable.
++// A second copy of this module in the process may publish the same roots again; a DIFFERENT value there (or one that can be
++// rewritten) means the helper would mount roots this server does not enforce, so the server refuses to start.
++const SANDBOX_WORKSPACE_ROOTS_KEY_0003B = Symbol.for("paperclip.hardening.workspaceRoots");
++const SANDBOX_WORKSPACE_ROOTS_VALUE_0003B = Object.freeze([...SANDBOX_WORKSPACE_ROOTS]);
++try {
++    Object.defineProperty(globalThis, SANDBOX_WORKSPACE_ROOTS_KEY_0003B, { value: SANDBOX_WORKSPACE_ROOTS_VALUE_0003B, writable: false, configurable: false, enumerable: false });
++}
++catch { /* an earlier copy of this module already published them: checked below */ }
++{
++    const published = globalThis[SANDBOX_WORKSPACE_ROOTS_KEY_0003B];
++    const descriptor = Object.getOwnPropertyDescriptor(globalThis, SANDBOX_WORKSPACE_ROOTS_KEY_0003B);
++    if (!Array.isArray(published) || !descriptor || descriptor.writable !== false || descriptor.configurable !== false ||
++        published.length !== SANDBOX_WORKSPACE_ROOTS_VALUE_0003B.length || published.some((root, index) => root !== SANDBOX_WORKSPACE_ROOTS_VALUE_0003B[index])) {
++        throw new Error("LOCAL-PATCH 0003b: the workspace roots published earlier in this process differ from the roots this server enforces; refusing to start.");
++    }
++}
++function sandboxIsHermesWrapperAgent0003B(agent, stored) {
++    return agent.adapterType === "hermes_local" && stored.command === SANDBOX_HERMES_WRAPPER_0003B;
++}
+ function sandboxStoredPlainEnvValue(binding) {
+     if (typeof binding === "string")
+         return binding;
+@@ -814,6 +861,11 @@
+     }
+     if (!managedAi && ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME"].includes(key))
+         return "redirects the credential directory that is bound into the sandbox";
++    // LOCAL-PATCH 0003b
++    if (sandboxIsStateRedirectEnv0003B(key) && !(managedAi && SANDBOX_MANAGED_AI_HOME_ENV_0003B.has(key)))
++        return "redirects the home, config or provider routing of the sandboxed CLI";
++    if (sandboxIsApiEndpointEnv0003B(key))
++        return "points the sandboxed CLI at another Paperclip API or runtime-tools endpoint";
+     return null;
+ }
+ async function sandboxRealPath(candidate) {
+@@ -849,7 +901,8 @@
+ }
+ async function enforceStoredSandboxConfig(input) {
+     const stored = parseObject(input.agent.adapterConfig);
+-    if (!stored.filesystemScope && !stored.networkScope)
++    // LOCAL-PATCH 0003b: a boxed Hermes agent has no scope in its config; its box is the wrapper command.
++    if (!stored.filesystemScope && !stored.networkScope && !sandboxIsHermesWrapperAgent0003B(input.agent, stored))
+         return input.runtimeConfig;
+     const config = { ...input.runtimeConfig };
+     const logAction = (action, message) => logger.warn({ event: "sandbox_enforcement", action, agentId: input.agent.id, runId: input.runId }, `sandbox enforcement: ${message}`);
+@@ -867,9 +920,16 @@
+     const storedEnv = parseObject(stored.env);
+     const nextEnv = { ...env };
+     for (const [key, value] of Object.entries(env)) {
+-        const reason = sandboxEnvDropReason(key, value, sandboxStoredPlainEnvValue(storedEnv[key]), input.managedAi);
++        const storedValue = sandboxStoredPlainEnvValue(storedEnv[key]);
++        const reason = sandboxEnvDropReason(key, value, storedValue, input.managedAi);
+         if (!reason)
+             continue;
++        // LOCAL-PATCH 0003b: where the board stored a plain value, that value comes back instead of nothing.
++        if (storedValue !== undefined) {
++            nextEnv[key] = storedValue;
++            logAction("restore_env", `restored stored env ${key}: the run value ${reason}`);
++            continue;
++        }
+         delete nextEnv[key];
+         logAction("drop_env", `dropped env ${key}: ${reason}`);
+     }

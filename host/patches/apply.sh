@@ -10,6 +10,10 @@
 # All-or-nothing: every pending patch is first trial-applied in sequence on a scratch copy of the target files; if any
 # patch (or an already-applied one that is only partly present) does not fit, NOTHING is changed.
 # Exit: 0 all applied | 1 a patch does not fit (tree untouched) | 3 --check found pending patches.
+# The patch list is the same as the plugin engine's (plugin/src/engine/registry.js, a test compares the two builds byte for byte);
+# apply.sh is the command-line route for a tree nobody manages with the plugin. Patches that stack on one file (0003 then 0003b)
+# are listed in the order they apply, and "already applied" is checked newest first. A tree patched with an OLDER patch set (for
+# example 0005a of v0.1.1) is reported as partly applied: restore the `.orig` files and run again, or let the plugin rebuild it.
 # Paperclip is NOT restarted here; the server and adapter-utils load the files at start, so restart after a change.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -27,12 +31,14 @@ patches=(
   "0001|$here/0001-sandbox-usrmerge-mounts.patch|node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js|// LOCAL-PATCH 0001"
   "0002|$here/0002-agent-self-config-change-grant.patch|node_modules/@paperclipai/server/dist/routes/agents.js|// LOCAL-PATCH 0002"
   "0003|$here/0003-spawn-time-sandbox-enforcement.patch|node_modules/@paperclipai/server/dist/services/heartbeat.js|// LOCAL-PATCH 0003"
+  "0003b|$here/0003b-hermes-engine-env-redirects.patch|node_modules/@paperclipai/server/dist/services/heartbeat.js|// LOCAL-PATCH 0003b"
   "0004|$here/0004-sandbox-proxy-epipe.patch|node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js|// LOCAL-PATCH 0004"
   "0005a|$here/0005a-new-agent-safe-defaults.patch|node_modules/@paperclipai/server/dist/services/agents.js|// LOCAL-PATCH 0005a"
   "0005c|$here/0005c-no-default-task-assign.patch|node_modules/@paperclipai/server/dist/routes/agents.js|// LOCAL-PATCH 0005c"
   "0005d|$here/0005d-no-default-task-assign-import.patch|node_modules/@paperclipai/server/dist/services/company-portability.js|// LOCAL-PATCH 0005d"
   "0005e|$here/0005e-no-default-agent-grants.patch|node_modules/@paperclipai/server/dist/services/agent-permissions.js|// LOCAL-PATCH 0005e|1005"
   "0005b|$here/0005b-fail-closed-spawn.patch|node_modules/@paperclipai/server/dist/services/heartbeat.js|// LOCAL-PATCH 0005b"
+  "0005f|$here/0005f-table-driven-admission.patch|node_modules/@paperclipai/server/dist/services/heartbeat.js|// LOCAL-PATCH 0005f"
   "0006a|$here/0006a-git-common-dir-spawn.patch|node_modules/@paperclipai/server/dist/services/heartbeat.js|// LOCAL-PATCH 0006"
   "0006b|$here/0006b-git-common-dir-sandbox-check.patch|node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js|// LOCAL-PATCH 0006"
   "0007|$here/0007-pipeline-structure-board-only.patch|node_modules/@paperclipai/server/dist/routes/pipelines.js|// LOCAL-PATCH 0007"
@@ -44,6 +50,19 @@ patches=(
   "0012|$here/0012-sandbox-no-proxy-localhost.patch|node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js|// LOCAL-PATCH 0012"
   "0013a|$here/0013a-agent-assign-needs-explicit-grant.patch|node_modules/@paperclipai/server/dist/services/authorization.js|// LOCAL-PATCH 0013"
   "0013b|$here/0013b-agent-access-no-simple-default.patch|node_modules/@paperclipai/server/dist/routes/agents.js|// LOCAL-PATCH 0013"
+  "0014|$here/0014-interaction-pending-addressee-wake.patch|node_modules/@paperclipai/server/dist/modules/run-dispatch/adapters/postgres.js|// LOCAL-PATCH 0014"
+  "0015|$here/0015-sandbox-public-web-wildcard.patch|node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js|// LOCAL-PATCH 0015"
+  "0016|$here/0016-per-agent-claude-config.patch|node_modules/@paperclipai/adapter-claude-local/dist/server/execute.js|// LOCAL-PATCH 0016"
+  "0017|$here/0017-boxed-sandbox-helper.patch|node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js|// LOCAL-PATCH 0017"
+  "0019|$here/0019-opencode-boxed-run.patch|node_modules/@paperclipai/adapter-opencode-local/dist/server/execute.js|// LOCAL-PATCH 0019"
+  "0019b|$here/0019b-opencode-boxed-model-discovery.patch|node_modules/@paperclipai/adapter-opencode-local/dist/server/models.js|// LOCAL-PATCH 0019b"
+  "0019c|$here/0019c-opencode-boxed-runtime-config.patch|node_modules/@paperclipai/adapter-opencode-local/dist/server/runtime-config.js|// LOCAL-PATCH 0019c"
+  "0019d|$here/0019d-opencode-boxed-environment-test.patch|node_modules/@paperclipai/adapter-opencode-local/dist/server/test.js|// LOCAL-PATCH 0019d"
+  "0025|$here/0025-sandbox-env-scrub.patch|node_modules/@paperclipai/adapter-utils/dist/server-utils.js|// LOCAL-PATCH 0025"
+  "0026|$here/0026-claude-boxed-adapter.patch|node_modules/@paperclipai/adapter-claude-local/dist/server/execute.js|// LOCAL-PATCH 0026"
+  "0026b|$here/0026b-claude-test-probe-project-settings.patch|node_modules/@paperclipai/adapter-claude-local/dist/server/test.js|// LOCAL-PATCH 0026b"
+  "0026c|$here/0026c-claude-acp-probe-project-settings.patch|node_modules/@paperclipai/adapter-claude-local/dist/server/acp.js|// LOCAL-PATCH 0026c"
+  "0027|$here/0027-adapter-test-board-only.patch|node_modules/@paperclipai/server/dist/routes/agents.js|// LOCAL-PATCH 0027"
 )
 # Resolve per-version patch files; drop optional entries that do not exist for this version.
 resolved=()
@@ -59,18 +78,24 @@ done
 patches=("${resolved[@]}")
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/paperclip-patch.XXXXXX"); trap 'rm -rf "$scratch"' EXIT
 
-# Phase 1: classify every patch against the real tree (read-only).
+# Phase 1: classify every patch against the real tree (read-only). Patches stack on one file (0003 then 0003b, 0016 then 0026, ...),
+# so an applied patch can only be reversed after the ones applied on top of it: per file, the applied patches (marker present) are
+# reversed newest first on a scratch copy; every reverse must fit, which proves that exactly these patches are applied and complete.
 declare -A state; bad=0; pending=()
+declare -A seen_rel
 for entry in "${patches[@]}"; do
   IFS='|' read -r id patch rel marker <<<"$entry"
   file="$tree/$rel"
   if [ ! -f "$file" ]; then echo "$id: MISSING target $rel" >&2; state[$id]=bad; bad=1; continue; fi
-  if grep -qF -- "$marker" "$file"; then
-    if patch -p1 -R -F0 --dry-run -s -d "$tree" <"$patch" >/dev/null 2>&1; then state[$id]=applied; echo "$id: already applied"
-    else echo "$id: marker present but the patch is only partly applied or is an older version of it ($rel); restore from $rel.orig and re-run" >&2; state[$id]=bad; bad=1; fi
-  else
-    state[$id]=pending; pending+=("$entry")
-  fi
+  if grep -qF -- "$marker" "$file"; then state[$id]=marked; else state[$id]=pending; pending+=("$entry"); fi
+done
+for ((i=${#patches[@]}-1; i>=0; i--)); do
+  entry="${patches[$i]}"
+  IFS='|' read -r id patch rel marker <<<"$entry"
+  [ "${state[$id]:-}" = marked ] || continue
+  if [ -z "${seen_rel[$rel]:-}" ]; then mkdir -p "$scratch/rev/$(dirname "$rel")"; cp -p "$tree/$rel" "$scratch/rev/$rel"; seen_rel[$rel]=1; fi
+  if patch -p1 -R -F0 -s --no-backup-if-mismatch -d "$scratch/rev" <"$patch" >/dev/null 2>&1; then state[$id]=applied; echo "$id: already applied"
+  else echo "$id: marker present but the patch is only partly applied or is an older version of it ($rel); restore from $rel.orig and re-run" >&2; state[$id]=bad; bad=1; fi
 done
 
 # Phase 2: trial-apply every pending patch in order on a scratch copy, so interactions between patches are caught too.

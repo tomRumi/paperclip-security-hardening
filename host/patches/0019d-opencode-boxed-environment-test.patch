@@ -1,0 +1,161 @@
+--- a/node_modules/@paperclipai/adapter-opencode-local/dist/server/test.js
++++ b/node_modules/@paperclipai/adapter-opencode-local/dist/server/test.js
+@@ -7,6 +7,8 @@
+ import { parseOpenCodeJsonl } from "./parse.js";
+ import { SANDBOX_INSTALL_COMMAND } from "../index.js";
+ import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
++import { boxedSandboxOptions, parseLocalProcessFilesystemScope, parseLocalProcessNetworkScope } from "@paperclipai/adapter-utils/local-process-sandbox"; // LOCAL-PATCH 0019d
++import { BOXED_OPENCODE_ENV, prepareBoxedOpenCodeState } from "./execute.js"; // LOCAL-PATCH 0019d
+ function summarizeStatus(checks) {
+     if (checks.some((check) => check.level === "error"))
+         return "fail";
+@@ -42,9 +44,13 @@
+ export async function testEnvironment(ctx) {
+     const checks = [];
+     const config = parseObject(ctx.config);
+-    const command = asString(config.command, "opencode");
+     const target = ctx.executionTarget ?? null;
+     const targetIsRemote = target?.kind === "remote";
++    // LOCAL-PATCH 0019d: a local probe runs on THIS server as the service user. The request's adapterConfig decides which config is tested, so
++    // it must not also decide which program is started: a command in it could be any script. A local probe starts the server's own OpenCode
++    // (PAPERCLIP_OPENCODE_COMMAND, else "opencode" on the server's PATH, the same as the model list of the UI). A remote target keeps the command
++    // of the config (it runs there, not here).
++    const command = targetIsRemote ? asString(config.command, "opencode") : (asString(process.env.PAPERCLIP_OPENCODE_COMMAND, "").trim() || "opencode");
+     const targetIsSandbox = target?.kind === "remote" && target.transport === "sandbox";
+     const cwd = resolveAdapterExecutionTargetCwd(target, asString(config.cwd, ""), process.cwd());
+     const targetLabel = targetIsRemote
+@@ -95,7 +101,47 @@
+     }
+     // Prevent OpenCode from writing an opencode.json into the working directory.
+     env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
+-    const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
++    // LOCAL-PATCH 0019d: for an agent with a filesystem or network scope every process the test starts (model discovery and the hello
++    // probe, which can run tools) runs in the same box as a real run, in a throw-away runtime dir, never on the server with the
++    // server's environment. When the box cannot be set up the probes are skipped (an error check), never run unboxed.
++    const boxRequired = Boolean(parseLocalProcessFilesystemScope(config.filesystemScope) || parseLocalProcessNetworkScope(config.networkScope)) && !targetIsRemote;
++    let boxDir = null;
++    let boxState = null;
++    let probeCwd = cwd;
++    if (boxRequired) {
++        try {
++            boxDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-envtest-box-"));
++            boxState = await prepareBoxedOpenCodeState({ companyId: ctx.companyId }, config, boxDir);
++            Object.assign(env, boxState.xdg, BOXED_OPENCODE_ENV);
++            if (!asString(config.cwd, "").trim()) {
++                probeCwd = path.join(boxDir, "cwd"); // no workspace configured: an empty one, not the server's working directory
++                await fs.mkdir(probeCwd, { recursive: true, mode: 0o700 });
++            }
++        }
++        catch (err) {
++            boxState = null;
++            checks.push({
++                code: "opencode_sandbox_unavailable",
++                level: "error",
++                message: `The sandbox for this agent could not be set up; no OpenCode process was started: ${err instanceof Error ? err.message : String(err)}`,
++            });
++        }
++    }
++    else if (!targetIsRemote) {
++        // LOCAL-PATCH 0019d: a probe without scopes is not boxed, so it does not run in the server's working directory (or in a workspace the agent
++        // writes) either: it gets an empty private directory, removed afterwards.
++        boxDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-envtest-cwd-"));
++        probeCwd = boxDir;
++    }
++    let preparedRuntimeConfig;
++    try {
++        preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config, boxedRuntimeDir: boxState?.runtimeDir });
++    }
++    catch (err) {
++        if (boxDir)
++            await fs.rm(boxDir, { recursive: true, force: true }).catch(() => { });
++        throw err;
++    }
+     const localRuntimeConfigHome = preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
+     if (asBoolean(config.dangerouslySkipPermissions, true)) {
+         checks.push({
+@@ -110,8 +156,29 @@
+     // `fs.mkdtemp` directory leaks on the early-throw path.
+     let preparedRuntimeWorkspaceLocalDir = null;
+     try {
++        let localProcessSandbox = null; // LOCAL-PATCH 0019d
++        if (boxState) {
++            try {
++                localProcessSandbox = boxedSandboxOptions({
++                    type: "opencode_local", config, env: preparedRuntimeConfig.env, workspaceDir: probeCwd, runtimeDir: boxState.runtimeDir,
++                    managedRw: boxState.managedHome ? [boxState.managedHome] : [], trustedUrls: [], companyId: ctx.companyId, runId,
++                });
++                if (localProcessSandbox?.homeDir)
++                    localProcessSandbox.homeDir = boxState.homeDir;
++                if (localProcessSandbox)
++                    localProcessSandbox.envPassNames = Object.keys(preparedRuntimeConfig.env);
++            }
++            catch (err) {
++                localProcessSandbox = null;
++                checks.push({
++                    code: "opencode_sandbox_unavailable",
++                    level: "error",
++                    message: `The sandbox for this agent could not be set up; no OpenCode process was started: ${err instanceof Error ? err.message : String(err)}`,
++                });
++            }
++        }
+         let runtimeTarget = target ?? null;
+-        let runtimeCwd = cwd;
++        let runtimeCwd = probeCwd;
+         if (targetIsRemote) {
+             preparedRuntimeWorkspaceLocalDir = await fs.mkdtemp(path.join(os.tmpdir(), `paperclip-opencode-envtest-${runId}-`));
+             const preparedExecutionTargetRuntime = await prepareAdapterExecutionTargetRuntime({
+@@ -186,7 +253,7 @@
+                 });
+             }
+         }
+-        const canRunProbe = checks.every((check) => check.code !== "opencode_cwd_invalid" && check.code !== "opencode_command_unresolvable");
++        const canRunProbe = checks.every((check) => check.code !== "opencode_cwd_invalid" && check.code !== "opencode_command_unresolvable" && check.code !== "opencode_sandbox_unavailable");
+         let modelValidationPassed = false;
+         const configuredModel = asString(config.model, "").trim();
+         // Model discovery and validation use local child processes against
+@@ -204,7 +271,7 @@
+         }
+         else if (canRunProbe && configuredModel) {
+             try {
+-                const discovered = await discoverOpenCodeModels({ command, cwd, env: runtimeEnv });
++                const discovered = await discoverOpenCodeModels({ command, cwd: probeCwd, env: runtimeEnv, localProcessSandbox });
+                 if (discovered.length > 0) {
+                     checks.push({
+                         code: "opencode_models_discovered",
+@@ -244,7 +311,7 @@
+         }
+         else if (!targetIsRemote && canRunProbe && !configuredModel) {
+             try {
+-                const discovered = await discoverOpenCodeModels({ command, cwd, env: runtimeEnv });
++                const discovered = await discoverOpenCodeModels({ command, cwd: probeCwd, env: runtimeEnv, localProcessSandbox });
+                 if (discovered.length > 0) {
+                     checks.push({
+                         code: "opencode_models_discovered",
+@@ -283,8 +350,9 @@
+                 await ensureOpenCodeModelConfiguredAndAvailable({
+                     model: configuredModel,
+                     command,
+-                    cwd,
++                    cwd: probeCwd,
+                     env: runtimeEnv,
++                    localProcessSandbox, // LOCAL-PATCH 0019d
+                 });
+                 checks.push({
+                     code: "opencode_model_configured",
+@@ -325,6 +393,7 @@
+                 const probe = await runAdapterExecutionTargetProcess(runId, runtimeTarget, command, args, {
+                     cwd: runtimeCwd,
+                     env: runtimeEnv,
++                    localProcessSandbox: localProcessSandbox ?? undefined, // LOCAL-PATCH 0019d
+                     timeoutSec: helloProbeTimeoutSec,
+                     graceSec: 5,
+                     stdin: "Respond with hello.",
+@@ -405,6 +474,8 @@
+             await fs.rm(preparedRuntimeWorkspaceLocalDir, { recursive: true, force: true }).catch(() => { });
+         }
+         await preparedRuntimeConfig.cleanup();
++        if (boxDir)
++            await fs.rm(boxDir, { recursive: true, force: true }).catch(() => { }); // LOCAL-PATCH 0019d
+     }
+     return {
+         adapterType: ctx.adapterType,

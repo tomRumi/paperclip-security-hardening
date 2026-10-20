@@ -125,7 +125,7 @@ test("the engine is built from the target and nothing else; the page shows the t
   assert.equal(st.available, true);
   assert.deepEqual(seen[0], { patchesDir: "/p", treeDir: "/t/tree", dataDir: "/t/data", restart: target.restart, refuseTreeChange: true });
   assert.deepEqual(st.target, { ok: true, source: "test", pid: null, tree: "/t/tree", instanceId: "dev", home: "/t", instanceRoot: "/t/instances/dev", dataDir: "/t/data",
-    configPath: target.configPath, restartUnit: "paperclipai-dev.service", restartNote: null });
+    configPath: target.configPath, deploymentMode: null, restartUnit: "paperclipai-dev.service", restartNote: null });
   assert.equal(st.configPath, target.configPath);
   assert.equal((await h.getSettings()).target.instanceId, "dev");
   await h.getStatus();

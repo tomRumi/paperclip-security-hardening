@@ -1,0 +1,204 @@
+--- a/node_modules/@paperclipai/adapter-opencode-local/dist/server/execute.js
++++ b/node_modules/@paperclipai/adapter-opencode-local/dist/server/execute.js
+@@ -12,7 +12,93 @@
+ import { prepareOpenCodeRuntimeConfig, prepareManagedOpenCodeRemoteHomes } from "./runtime-config.js";
+ import { SANDBOX_INSTALL_COMMAND } from "../index.js";
+ import { resolveOpenCodeSkillsHome } from "./skills.js";
++import { boxedSandboxOptions, ensureBoxedRuntimeDir, parseLocalProcessFilesystemScope, parseLocalProcessNetworkScope, registerBoxedAdapter } from "@paperclipai/adapter-utils/local-process-sandbox"; // LOCAL-PATCH 0019
++import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils"; // LOCAL-PATCH 0019
+ const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
++// LOCAL-PATCH 0019: opencode_local runs in Paperclip's built-in sandbox (patch 0017) when the agent has a filesystemScope or a
++// networkScope. This process runs the type through the box from here on, which the spawn-time admission (0005f) checks.
++registerBoxedAdapter("opencode_local");
++// Fixed for a boxed run, after the agent's own env (same values as BOX_PROFILES.opencode_local.boxEnv of the hardening plugin,
++// a test compares them): no model-list download, no self-update, no language-server download, no opencode.json written into
++// the workspace. They stop the background network use that the allowlist would only deny.
++export const BOXED_OPENCODE_ENV = Object.freeze({
++    OPENCODE_DISABLE_MODELS_FETCH: "1",
++    OPENCODE_DISABLE_AUTOUPDATE: "1",
++    OPENCODE_DISABLE_LSP_DOWNLOAD: "1",
++    OPENCODE_DISABLE_PROJECT_CONFIG: "true",
++});
++const BOXED_OPENCODE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
++// The agent's own state: <instance>/companies/<company>/agents/<agent>/opencode-runtime/home is HOME and holds config, data
++// (sessions, auth.json), cache and state, so two agents never share a directory and nothing is written to the home of the
++// user running Paperclip. With a managed AI connection the server hands the run its own credential home (a paperclip-ai-*
++// directory in the temp dir, with HOME and the XDG variables in config.env): that one is the box home instead, so the
++// credential it holds reaches the run exactly as before, and nothing else from the server's home does.
++// `runtimeDirOverride` is for the environment test (test.js), which has no agent (it passes {companyId} only): a throw-away directory it removes afterwards.
++export async function prepareBoxedOpenCodeState(agent, config, runtimeDirOverride = null) {
++    if (!runtimeDirOverride) {
++        for (const id of [agent?.companyId, agent?.id]) {
++            if (!BOXED_OPENCODE_ID_PATTERN.test(String(id ?? "")))
++                throw new Error(`Boxed OpenCode: "${String(id)}" is not a valid company or agent id.`);
++        }
++    }
++    const runtime = await ensureBoxedRuntimeDir(runtimeDirOverride
++        ?? path.join(resolvePaperclipInstanceRootForAdapter({ env: process.env }), "companies", agent.companyId, "agents", agent.id, "opencode-runtime"));
++    if (config.managedAiConnection) {
++        const configured = asString(parseObject(config.env).HOME, "").trim();
++        const managedHome = configured ? await fs.realpath(configured).catch(() => "") : "";
++        const tmpDir = await fs.realpath(os.tmpdir()).catch(() => os.tmpdir());
++        // The server names the home after the company it prepared it for (paperclip-ai-<company>-<grant>-*): a directory of another
++        // company, or of anyone else who can write the temp dir, is not this run's credential home.
++        const companyId = String(agent?.companyId ?? "");
++        if (!managedHome || path.dirname(managedHome) !== tmpDir || !BOXED_OPENCODE_ID_PATTERN.test(companyId) || !path.basename(managedHome).startsWith(`paperclip-ai-${companyId}-`)) {
++            throw new Error("Boxed OpenCode: the managed AI connection's credential home is missing or is not a directory the server created for this run.");
++        }
++        return {
++            runtimeDir: runtime.dir,
++            homeDir: managedHome,
++            managedHome,
++            xdg: {
++                XDG_CONFIG_HOME: path.join(managedHome, "config"),
++                XDG_DATA_HOME: path.join(managedHome, "data"),
++                XDG_CACHE_HOME: path.join(managedHome, "cache"),
++                XDG_STATE_HOME: path.join(managedHome, "state"),
++            },
++        };
++    }
++    return {
++        runtimeDir: runtime.dir,
++        homeDir: runtime.homeDir,
++        managedHome: null,
++        xdg: {
++            XDG_CONFIG_HOME: path.join(runtime.homeDir, ".config"),
++            XDG_DATA_HOME: path.join(runtime.homeDir, ".local", "share"),
++            XDG_CACHE_HOME: path.join(runtime.homeDir, ".cache"),
++            XDG_STATE_HOME: path.join(runtime.homeDir, ".local", "state"),
++        },
++    };
++}
++// Skills of a boxed run are COPIED into the box home (<home>/.claude/skills), not linked: the sources lie in the skills catalog
++// or the company's skills directory, which the box never mounts (the instance directory is closed to it). The directory is
++// rebuilt every run, so it holds exactly the skills selected for the agent.
++async function ensureBoxedOpenCodeSkills(onLog, skillsEntries, desiredSkillNames, skillsHome) {
++    const desiredSet = new Set(desiredSkillNames ?? skillsEntries.map((entry) => entry.key));
++    await fs.rm(skillsHome, { recursive: true, force: true });
++    await fs.mkdir(skillsHome, { recursive: true, mode: 0o700 });
++    for (const entry of skillsEntries) {
++        if (!desiredSet.has(entry.key) || isPaperclipSkillSourceMissing(entry))
++            continue;
++        try {
++            if (path.basename(String(entry.runtimeName)) !== entry.runtimeName || entry.runtimeName === "." || entry.runtimeName === "..") {
++                throw new Error(`"${entry.runtimeName}" is not a plain skill directory name`);
++            }
++            await fs.cp(await fs.realpath(entry.source), path.join(skillsHome, entry.runtimeName), { recursive: true, force: true, dereference: false, verbatimSymlinks: true });
++            await onLog("stderr", `[paperclip] Copied OpenCode skill "${entry.key}" into ${skillsHome}\n`);
++        }
++        catch (err) {
++            await onLog("stderr", `[paperclip] Failed to copy OpenCode skill "${entry.key}" into ${skillsHome}: ${err instanceof Error ? err.message : String(err)}\n`);
++        }
++    }
++}
+ function firstNonEmptyLine(text) {
+     return (text
+         .split(/\r?\n/)
+@@ -148,8 +234,17 @@
+     await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
+     const openCodeSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
+     const desiredOpenCodeSkillNames = resolveLegacyPaperclipDesiredSkillNames(config, openCodeSkillEntries);
++    // LOCAL-PATCH 0019: a scoped agent gets its own state and skills directory (see prepareBoxedOpenCodeState)
++    const boxFilesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
++    const boxNetworkScope = parseLocalProcessNetworkScope(config.networkScope);
++    const boxState = (boxFilesystemScope || boxNetworkScope) && !executionTargetIsRemote ? await prepareBoxedOpenCodeState(agent, config) : null;
+     if (!executionTargetIsRemote) {
+-        await ensureOpenCodeSkillsInjected(onLog, openCodeSkillEntries, desiredOpenCodeSkillNames, resolveOpenCodeSkillsHome(config));
++        if (boxState && boxFilesystemScope) {
++            await ensureBoxedOpenCodeSkills(onLog, openCodeSkillEntries, desiredOpenCodeSkillNames, path.join(boxState.homeDir, ".claude", "skills"));
++        }
++        else {
++            await ensureOpenCodeSkillsInjected(onLog, openCodeSkillEntries, desiredOpenCodeSkillNames, resolveOpenCodeSkillsHome(config));
++        }
+     }
+     const envConfig = parseObject(config.env);
+     const env = {
+@@ -157,6 +252,15 @@
+         ...buildRuntimeToolsEnv(ctx.runtimeTools),
+     };
+     env.PAPERCLIP_RUN_ID = runId;
++    // LOCAL-PATCH 0019: the URLs the box's network proxy trusts besides the allowlist (the Paperclip API and the runtime-tools
++    // endpoints), from the values computed above and BEFORE config.env is merged into env (refreshPaperclipWorkspaceEnvForExecution
++    // below): an entry of config.env or a run-level override must not be able to open the proxy to another host.
++    const boxTrustedUrls = [
++        env.PAPERCLIP_API_URL,
++        env.PAPERCLIP_RUNTIME_TOOLS_MCP_URL,
++        env.PAPERCLIP_RUNTIME_TOOLS_CONNECTIONS_SEARCH_URL,
++        env.PAPERCLIP_RUNTIME_TOOLS_CONNECTION_REQUEST_URL,
++    ].filter((value) => typeof value === "string" && value.length > 0);
+     const wakeTaskId = (typeof context.taskId === "string" && context.taskId.trim().length > 0 && context.taskId.trim()) ||
+         (typeof context.issueId === "string" && context.issueId.trim().length > 0 && context.issueId.trim()) ||
+         null;
+@@ -208,15 +312,40 @@
+     // selection is already handled via the --model CLI flag.  Set after the
+     // envConfig loop so user overrides cannot disable this guard.
+     env.OPENCODE_DISABLE_PROJECT_CONFIG = "true";
++    // LOCAL-PATCH 0019: assigned after the config.env merge, so an agent's env cannot win. XDG_CONFIG_HOME is also where the
++    // runtime config below copies the agent's own opencode config from (never the server user's ~/.config/opencode).
++    if (boxState)
++        Object.assign(env, boxState.xdg, BOXED_OPENCODE_ENV);
+     if (authToken) {
+         env.PAPERCLIP_API_KEY = authToken;
+     }
+-    const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
++    const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config, boxedRuntimeDir: boxState?.runtimeDir }); // LOCAL-PATCH 0019: the config copy lives in the agent's runtime dir
+     const localRuntimeConfigHome = preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
+     try {
+         const runtimeEnv = Object.fromEntries(Object.entries(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env })).filter((entry) => typeof entry[1] === "string"));
+         const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(executionTarget, asNumber(config.timeoutSec, 0));
+         const graceSec = asNumber(config.graceSec, 20);
++        // LOCAL-PATCH 0019: the box mounts the agent's runtime dir (which holds the config copy made above, patch 0019c) and the managed home.
++        const localProcessSandbox = boxState
++            ? boxedSandboxOptions({
++                type: "opencode_local",
++                config,
++                env: preparedRuntimeConfig.env,
++                workspaceDir: cwd,
++                runtimeDir: boxState.runtimeDir,
++                managedRw: [boxState.managedHome, localRuntimeConfigHome]
++                    .filter((value) => typeof value === "string" && value.length > 0 && !(value + path.sep).startsWith(boxState.runtimeDir + path.sep)),
++                trustedUrls: boxTrustedUrls,
++                agentId: agent.id,
++                companyId: agent.companyId,
++                runId,
++            })
++            : null;
++        if (localProcessSandbox) {
++            if (localProcessSandbox.homeDir)
++                localProcessSandbox.homeDir = boxState.homeDir;
++            localProcessSandbox.envPassNames = Object.keys(preparedRuntimeConfig.env);
++        }
+         await ensureAdapterExecutionTargetRuntimeCommandInstalled({
+             runId,
+             target: executionTarget,
+@@ -244,6 +373,7 @@
+                 command,
+                 cwd,
+                 env: runtimeEnv,
++                localProcessSandbox, // LOCAL-PATCH 0019: `opencode models` runs in the box too (HOME = the box home)
+             });
+         }
+         const extraArgs = (() => {
+@@ -396,6 +526,8 @@
+         }
+         const commandNotes = (() => {
+             const notes = [...preparedRuntimeConfig.notes];
++            if (localProcessSandbox)
++                notes.push(`Running OpenCode in the Paperclip sandbox (${[boxFilesystemScope ? "workspace filesystem" : null, boxNetworkScope ? `${boxNetworkScope} network` : null].filter(Boolean).join(", ")}).`); // LOCAL-PATCH 0019
+             if (!resolvedInstructionsFilePath)
+                 return notes;
+             if (instructionsPrefix.length > 0) {
+@@ -491,10 +623,13 @@
+                     context,
+                 });
+             }
++            if (localProcessSandbox)
++                localProcessSandbox.envPassNames = Object.keys(preparedRuntimeConfig.env); // LOCAL-PATCH 0019: the names of THIS run's env object, read right before the spawn
+             const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
+                 onProcessStopped: providerStop.beginInvocation(),
+                 cwd,
+                 env: preparedRuntimeConfig.env,
++                localProcessSandbox: localProcessSandbox ?? undefined, // LOCAL-PATCH 0019
+                 stdin: prompt,
+                 timeoutSec,
+                 graceSec,

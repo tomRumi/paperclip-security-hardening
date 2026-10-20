@@ -127,6 +127,29 @@ test("environment only: PAPERCLIP_HOME and PAPERCLIP_INSTANCE_ID of the server; 
   assert.equal(m.resolve(4242, { userHome: path.join(m.dir, "passwd-home") }).target.home, path.join(m.dir, "passwd-home", ".paperclip"));
 });
 
+test("deployment mode as the server resolves it: PAPERCLIP_DEPLOYMENT_MODE (environment, else .env), else server.deploymentMode of its config.json, else local_trusted", () => {
+  const mode = (setup, env = {}) => {
+    const m = machine();
+    m.server({ env });
+    setup?.(m);
+    const r = m.resolve();
+    assert.equal(r.ok, true, r.reason);
+    return r.target.deploymentMode;
+  };
+  const instance = (m) => path.join(m.home, ".paperclip/instances/default");
+  const writeConfig = (m, text) => { fs.mkdirSync(instance(m), { recursive: true }); fs.writeFileSync(path.join(instance(m), "config.json"), text); };
+  assert.equal(mode(), "local_trusted", "no config file: the server's default");
+  assert.equal(mode((m) => writeConfig(m, JSON.stringify({ server: { deploymentMode: "authenticated" } }))), "authenticated");
+  assert.equal(mode((m) => writeConfig(m, JSON.stringify({ server: { deploymentMode: "local_trusted" } }))), "local_trusted");
+  assert.equal(mode((m) => writeConfig(m, JSON.stringify({ server: {} }))), "local_trusted", "the key is absent: the default");
+  assert.equal(mode((m) => writeConfig(m, JSON.stringify({ server: { deploymentMode: "authenticated" } })), { PAPERCLIP_DEPLOYMENT_MODE: "local_trusted" }), "local_trusted", "the environment wins");
+  assert.equal(mode((m) => writeConfig(m, JSON.stringify({ server: { deploymentMode: "local_trusted" } })), { PAPERCLIP_DEPLOYMENT_MODE: "authenticated" }), "authenticated");
+  assert.equal(mode((m) => writeConfig(m, JSON.stringify({ server: { deploymentMode: "local_trusted" } })), { PAPERCLIP_DEPLOYMENT_MODE: "bogus" }), "local_trusted", "an invalid value is ignored, as the server does");
+  assert.equal(mode((m) => { writeConfig(m, JSON.stringify({ server: { deploymentMode: "local_trusted" } })); fs.writeFileSync(path.join(instance(m), ".env"), "PAPERCLIP_DEPLOYMENT_MODE=authenticated\n"); }), "authenticated", "a .env the server loads gives it too");
+  assert.equal(mode((m) => writeConfig(m, "{ not json")), null, "unreadable: not guessed");
+  assert.equal(mode((m) => writeConfig(m, JSON.stringify({ server: { deploymentMode: "weird" } }))), null);
+});
+
 test("invalid instance id and relative home are refused", () => {
   const m = machine();
   m.server({ argv: ["node", m.script, "run", "--instance", "../x"] });

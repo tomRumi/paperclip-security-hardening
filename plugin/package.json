@@ -1,6 +1,6 @@
 {
   "name": "paperclip-security-hardening",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Paperclip plugin: one switch per sandbox protection (rebuilt from Paperclip's original files, one restart per save), Agent boxes with daily token caps, a self-test after every restart, and one-line installs for the watchdog and the Hermes wrapper.",
   "type": "module",
   "license": "MIT",

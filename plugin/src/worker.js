@@ -18,6 +18,28 @@ export const ACTIONS = ["getStatus", "getSettings", "planChange", "applyChange",
  *  actions carry the caller's identity. */
 export const BOX_ACTIONS = ["listCompanies", "agentBoxes", "takeOverBox", "saveBox", "saveCompanyCaps", "saveAgentCap", "saveCapsInstall"];
 
+const trimmed = (v) => (typeof v === "string" ? v.trim() : "");
+const sameException = (a, b) => trimmed(a?.agentId) === trimmed(b?.agentId) && trimmed(a?.type) === trimmed(b?.type) && trimmed(a?.reason) === trimmed(b?.reason);
+
+/**
+ * Remote exceptions as an admin submitted them, with addedBy/addedAt set here and never taken from the request: an entry that
+ * is unchanged (same agent, type and reason) keeps the previous stamp, a new or edited one gets the caller and the time.
+ */
+export function stampExceptions(submitted, previous, userId, now = new Date().toISOString()) {
+  if (!Array.isArray(submitted)) return submitted; // normalizeSettings reports it
+  return submitted.map((e) => {
+    if (!e || typeof e !== "object" || Array.isArray(e)) return e;
+    const before = (previous ?? []).find((p) => sameException(p, e));
+    return { ...e, addedBy: before ? before.addedBy : userId, addedAt: before ? before.addedAt : now };
+  });
+}
+
+/** What changed between two remoteExceptions lists: [{change: "added" | "removed", entry}] (an edited reason is a removal and an addition). */
+export function exceptionChanges(previous, next) {
+  const gone = (list, other) => list.filter((e) => !other.some((o) => sameException(o, e)));
+  return [...gone(previous ?? [], next ?? []).map((entry) => ({ change: "removed", entry })), ...gone(next ?? [], previous ?? []).map((entry) => ({ change: "added", entry }))];
+}
+
 /** The services of the running worker (onWebhook needs them; it is not registered through ctx). */
 let services = null;
 
@@ -36,11 +58,11 @@ export function register(ctx, { hardening, boxes, caps, hosts, recheck, itsec } 
   const c = caps ?? createCaps({ ctx, assertAdmin, runLogBase: () => h.target().runLogBase, userHome: () => { try { return h.target().userHome; } catch { return null; } } });
   // No applyBox: the plugin SDK has no capability to change an agent's adapterConfig (see boxes.js).
   const b = boxes ?? createBoxes({ ctx, assertAdmin, loadSettings: () => h.loadSettings(), capsView: (companyId, agents) => c.view(companyId, agents) });
-  // The compliance check uses the install-wide Hermes wrapper path from the hardening settings.
+  // The compliance check uses the install-wide Hermes wrapper path and remote exceptions from the hardening settings.
   const cfg = async (companyId) => {
     const company = (await ctx.config.get(companyId)) ?? {};
     const site = await h.loadSettings().catch(() => null);
-    return site?.hermesWrapperPath ? { ...company, hermesWrapperPath: site.hermesWrapperPath } : company;
+    return { ...company, ...(site?.hermesWrapperPath ? { hermesWrapperPath: site.hermesWrapperPath } : {}), remoteExceptions: site?.remoteExceptions ?? [] };
   };
 
   ctx.data.register("compliance", async ({ companyId }) => {
@@ -56,7 +78,25 @@ export function register(ctx, { hardening, boxes, caps, hosts, recheck, itsec } 
   ctx.actions.register("applyChange", (params, context) => h.applyChange(params, context));
   ctx.actions.register("restart", (params, context) => h.restart(params, context));
   ctx.actions.register("restoreAll", (params, context) => h.restoreAll(params, context));
-  ctx.actions.register("saveSettings", (params, context) => h.saveSettings(params, context));
+  // Remote exceptions are part of the site settings (admin-only, like every other field). This wrapper sets who added an
+  // exception and when, and logs each addition and removal.
+  ctx.actions.register("saveSettings", async (params, context) => {
+    const actor = await assertAdmin(context);
+    const given = params?.settings && typeof params.settings === "object" && "remoteExceptions" in params.settings;
+    if (!given) return h.saveSettings(params, context);
+    const prev = (await h.loadSettings()).remoteExceptions ?? [];
+    const r = await h.saveSettings({ ...params, settings: { ...params.settings, remoteExceptions: stampExceptions(params.settings.remoteExceptions, prev, actor.userId) } }, context);
+    if (!r.ok) return r;
+    const companyId = context?.companyId ?? actor.companyId ?? r.settings.alertCompanyId ?? null;
+    for (const { change, entry } of exceptionChanges(prev, r.settings.remoteExceptions)) {
+      const message = `Security hardening: remote exception ${change} for ${entry.type} agent ${entry.agentId}`;
+      const metadata = { userId: actor.userId, change, agentId: entry.agentId, type: entry.type, reason: entry.reason, addedBy: entry.addedBy, addedAt: entry.addedAt };
+      if (!companyId) { ctx.logger?.info?.(message, metadata); continue; }
+      try { await ctx.activity.log({ companyId, message, entityType: "plugin", entityId: PLUGIN_ID, metadata }); }
+      catch (e) { ctx.logger?.warn?.(`activity log entry not written: ${e.message}`, { message }); }
+    }
+    return r;
+  });
   ctx.actions.register("runSelfTest", (params, context) => h.runSelfTest(params, context));
   ctx.actions.register("hostInstallCommand", (params, context) => w.command(params, context));
 

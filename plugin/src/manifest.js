@@ -63,7 +63,7 @@ export const PLUGIN_ID = "paperclip-security-hardening";
 const manifest = {
   id: PLUGIN_ID,
   apiVersion: 1,
-  version: "0.1.1",
+  version: "0.2.0",
   displayName: "Security hardening",
   description: "Switches the sandbox protections on and off (each one rebuilt from Paperclip's original files, one restart per save), keeps the site values in one settings file, and verifies every agent's sandbox configuration.",
   author: "tomRumi",

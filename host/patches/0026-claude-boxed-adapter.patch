@@ -1,0 +1,137 @@
+--- a/node_modules/@paperclipai/adapter-claude-local/dist/server/execute.js
++++ b/node_modules/@paperclipai/adapter-claude-local/dist/server/execute.js
+@@ -7,6 +7,6 @@
+ import { buildSkillLibraryManifestMarkdown } from "@paperclipai/adapter-utils/skill-library-manifest";
+-import { parseLocalProcessFilesystemScope, parseLocalProcessSandboxExtraPaths, parseLocalProcessNetworkAllowlist, parseLocalProcessNetworkScope, } from "@paperclipai/adapter-utils/local-process-sandbox";
++import { parseLocalProcessFilesystemScope, parseLocalProcessNetworkScope, boxedSandboxOptions, ensureBoxedRuntimeDir, registerBoxedAdapter, } from "@paperclipai/adapter-utils/local-process-sandbox"; // LOCAL-PATCH 0026
+ import { claudeModelUsageTotals, parseClaudeStreamJson, describeClaudeFailure, detectClaudeLoginRequired, extractClaudeRetryNotBefore, isClaudeMaxTurnsResult, isClaudeProviderQuotaError, isClaudeRefusalResult, isClaudeTransientUpstreamError, isClaudeUnknownSessionError, isClaudePoisonedPreviousMessageIdError, isClaudeImageProcessingError, isClaudeModelNotFoundError, } from "./parse.js";
+ import { materializeRemoteClaudeConfig, prepareClaudeConfigSeed, resolveManagedClaudeRuntimeStateDir, resolveSharedClaudeConfigDir, writePaperclipClaudeMcpConfig, } from "./claude-config.js";
+-import { claudeCliVersionAtLeast, claudeCommandLooksLike, claudeCommandSupportsEffortFlag, minimumClaudeCliVersionForModel, readClaudeCommandVersion, } from "./cli-capabilities.js";
++import { claudeCliVersionAtLeast, claudeCommandLooksLike, claudeCommandSupportsEffortFlag, minimumClaudeCliVersionForModel, parseClaudeCliVersion, readClaudeCommandVersion, } from "./cli-capabilities.js"; // LOCAL-PATCH 0026
+ import { resolveClaudeDesiredSkillNames } from "./skills.js";
+@@ -48,2 +48,54 @@
+ }
++// LOCAL-PATCH 0026: claude_local runs in the shared box of patch 0017 (boxedSandboxOptions) with the environment scrub of patch 0025.
++// registerBoxedAdapter tells the spawn-time admission (0005f) that this server boxes claude_local. The box gets the agent id and
++// company id (the only agents/<id> directory it may mount is this agent's own), the Paperclip URLs the proxy trusts are the ones
++// the adapter computed itself (never a config.env value), and the child sees BASE_ENV_ALLOW plus the names of the adapter's OWN env.
++registerBoxedAdapter("claude_local");
++// The scrub reads the names when the child starts: the adapter adds workspace variables to env after the box is built, so every
++// spawn goes through this. The names are the keys of the adapter's own env (never process.env): the credentials of the agent's
++// config.env, the PAPERCLIP_ run variables (run id, agent id, API url and run token, wake and workspace variables) and CLAUDE_CONFIG_DIR.
++function withClaudeEnvPassNames(localProcessSandbox, env) {
++    if (localProcessSandbox)
++        localProcessSandbox.envPassNames = Object.keys(env);
++    return localProcessSandbox;
++}
++// The minimum-version probe runs the agent's `claude` command; for a boxed agent it runs in the same box, with the same scrubbed env,
++// like the run itself (readClaudeCommandVersion would spawn it outside the box with the server environment).
++async function readClaudeCommandVersionForRun(input) {
++    if (!input.localProcessSandbox)
++        return readClaudeCommandVersion(input);
++    const version = await runAdapterExecutionTargetProcess(input.runId, input.target, input.command, ["--version"], {
++        cwd: input.cwd,
++        env: input.env,
++        timeoutSec: Math.max(1, Math.min(input.timeoutSec, 20)),
++        graceSec: Math.max(1, Math.min(input.graceSec, 5)),
++        onLog: async () => { },
++        localProcessSandbox: withClaudeEnvPassNames(input.localProcessSandbox, input.env),
++    }).catch(() => null);
++    if (!version || version.timedOut || version.exitCode !== 0)
++        return null;
++    return parseClaudeCliVersion(`${version.stdout}\n${version.stderr}`);
++}
++// `claude login` for a boxed agent runs in the agent's box (its own Claude dir, scrubbed env), not as the server user with the server env.
++async function prepareBoxedClaudeLogin(input, runtime) {
++    const stateDir = resolveManagedClaudeRuntimeStateDir(process.env, input.agent.companyId, input.agent.id);
++    const sandbox = boxedSandboxOptions({
++        type: "claude_local",
++        config: input.config,
++        env: runtime.env,
++        agentId: input.agent.id,
++        companyId: input.agent.companyId,
++        workspaceDir: runtime.cwd,
++        runtimeDir: stateDir,
++        trustedUrls: [buildPaperclipEnv(input.agent).PAPERCLIP_API_URL],
++    });
++    if (!sandbox)
++        return null;
++    if (sandbox.filesystemScope)
++        await ensureBoxedRuntimeDir(stateDir);
++    const configDir = path.join(stateDir, "home", ".claude");
++    await ensurePerAgentClaudeConfigDir(configDir, resolveSharedClaudeConfigDir(process.env));
++    runtime.env.CLAUDE_CONFIG_DIR = configDir;
++    return withClaudeEnvPassNames(sandbox, runtime.env);
++}
+ function hasNonEmptyEnvValue(env, key) {
+@@ -240,2 +292,3 @@
+     });
++    const loginSandbox = await prepareBoxedClaudeLogin(input, runtime); // LOCAL-PATCH 0026
+     const proc = await runAdapterExecutionTargetProcess(input.runId, null, runtime.command, ["login"], {
+@@ -246,2 +299,3 @@
+         onLog,
++        localProcessSandbox: loginSandbox, // LOCAL-PATCH 0026
+     });
+@@ -379,2 +433,5 @@
+     const claudeRuntimeStateDir = resolveManagedClaudeRuntimeStateDir(process.env, agent.companyId, agent.id);
++    // LOCAL-PATCH 0026: a boxed run needs the runtime dir (0700, ours, no symlink); the box mounts it before the run.
++    if (!executionTargetIsRemote && parseLocalProcessFilesystemScope(config.filesystemScope))
++        await ensureBoxedRuntimeDir(claudeRuntimeStateDir);
+     const localMcpConfigPath = await writePaperclipClaudeMcpConfig({
+@@ -391,23 +448,21 @@
+     const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
+-    const localProcessSandbox = (filesystemScope || networkScope) && !executionTargetIsRemote
+-        ? {
+-            workspaceDir: effectiveExecutionCwd,
+-            filesystemScope,
+-            managedPaths: [
+-                { path: sandboxClaudeConfigDir, access: "rw" }, // LOCAL-PATCH 0016
+-                { path: path.join(path.dirname(sandboxClaudeConfigDir), ".claude.json"), access: "rw" }, // LOCAL-PATCH 0016
+-                { path: promptBundle.addDir, access: "ro" },
+-                { path: localMcpConfigDir, access: "ro" },
+-            ],
+-            extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
+-            homeDir: filesystemScope ? path.dirname(sandboxClaudeConfigDir) : null, // LOCAL-PATCH 0016
+-            networkScope,
+-            networkAllowlist: parseLocalProcessNetworkAllowlist(config.networkAllowlist),
+-            networkTrustedUrls: [
+-                env.PAPERCLIP_API_URL,
+-                ...runtimeMcpServers.map((server) => server.url),
+-            ].filter((value) => typeof value === "string" && value.length > 0),
+-            command: asString(config.filesystemSandboxCommand, "bwrap"),
+-        }
+-        : null;
++    // LOCAL-PATCH 0026: the box comes from patch 0017. The proxy trusts the Paperclip API URL as buildPaperclipEnv computes it (env
++    // has had config.env merged in by now) and the runtime MCP servers; a managed AI connection's credential home (made by the
++    // server, outside the instance) is mounted as the stock code did. envPassNames is set again right before each spawn.
++    const localProcessSandbox = boxedSandboxOptions({
++        type: "claude_local",
++        config,
++        env,
++        agentId: agent.id,
++        companyId: agent.companyId,
++        workspaceDir: effectiveExecutionCwd,
++        runtimeDir: claudeRuntimeStateDir,
++        managedRw: config.managedAiConnection && filesystemScope ? [path.dirname(sandboxClaudeConfigDir)] : [],
++        managedRo: [promptBundle.addDir, localMcpConfigDir], // the company's claude-prompt-cache is mountable read-only (0017)
++        trustedUrls: [
++            buildPaperclipEnv(agent).PAPERCLIP_API_URL,
++            ...runtimeMcpServers.map((server) => server.url),
++        ],
++        remoteTarget: executionTargetIsRemote,
++    });
+     if (localProcessSandbox) {
+@@ -755,3 +810,3 @@
+             },
+-            localProcessSandbox,
++            localProcessSandbox: withClaudeEnvPassNames(localProcessSandbox, env), // LOCAL-PATCH 0026
+         });
+@@ -1021,3 +1076,3 @@
+         if (minimumCliVersion) {
+-            const detectedCliVersion = await readClaudeCommandVersion({
++            const detectedCliVersion = await readClaudeCommandVersionForRun({
+                 runId,
+@@ -1029,2 +1084,3 @@
+                 graceSec,
++                localProcessSandbox, // LOCAL-PATCH 0026
+             });

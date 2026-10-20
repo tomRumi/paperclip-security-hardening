@@ -7,39 +7,31 @@
 //       public-web      same module: "*:443" is accepted, "*" and "*.example.com" stay refused (patch 0015)
 //       own-box         evaluates the 0003 block cut out of the built heartbeat.js (stub logger, so no real
 //                       enforcement log line is written): a run override that widens the network, injects LD_PRELOAD
-//                       or launches outside the workspace roots is restored, dropped or refused
+//                       or launches outside the workspace roots is restored, dropped or refused; an engine override is restored
 //       safe-defaults   evaluates the 0005a block cut out of the built services/agents.js: a new agent created
 //                       unboxed with canCreateAgents/canCreateSkills comes out boxed and without them
+//       box-claude      real-bubblewrap probes of the box around Claude agents, no adapter run and no credential
+//                       (src/selftest-box.js): spawn target, writes and reads outside the workspace, a refused host and its
+//                       sandbox_network_denied line, the server's environment kept out of the child
+//       box-opencode    the spawn target of an OpenCode run (the helper itself is checked under box-claude)
+//       only-boxed      evaluates the admission block of the built heartbeat.js: an unboxed, unregistered or unscrubbed agent is
+//                       refused with the reason named, a boxed Claude and OpenCode agent are admitted
 //   - every applied protection also gets the structural check: each of its files equals the engine's recorded built
 //     sha256 and contains the markers of its patches. A protection with no functional check is "structural only".
-// The other protections (only-boxed, no-permission-handing, pipeline-board-only, assign-needs-grant,
-// own-claude-folder) change route handlers or adapter code that cannot be called without a database, an
-// authenticated agent request or a real run, so they are structural only.
+// The other protections (no-permission-handing, pipeline-board-only, assign-needs-grant, own-claude-folder) change route
+// handlers or adapter code that cannot be called without a database, an authenticated agent request or a real run, so they
+// are structural only.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 import { PATCHES } from "./engine/registry.js";
-import { sha256 } from "./engine/store.js";
-import { extractBlock, evalBlock } from "./patch-block.js";
+import {
+  SANDBOX_FILE, HEARTBEAT_FILE, AGENTS_FILE, importBuilt, evalBuiltBlock, expectThrow,
+} from "./selftest-util.js";
+import { BOX_CLAUDE_CHECKS, BOX_OPENCODE_CHECKS, ADMISSION_CHECKS } from "./selftest-box.js";
 
-export const SANDBOX_FILE = "node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js";
-export const HEARTBEAT_FILE = "node_modules/@paperclipai/server/dist/services/heartbeat.js";
-export const AGENTS_FILE = "node_modules/@paperclipai/server/dist/services/agents.js";
+export { SANDBOX_FILE, HEARTBEAT_FILE, AGENTS_FILE };
 const USR_MERGE = ["/bin", "/sbin", "/lib", "/lib64"];
-
-/** Import a built module by content: the same content is imported once, a changed file gets a fresh instance. */
-async function importBuilt(tree, rel) {
-  const file = path.join(tree, rel);
-  const sha = sha256(fs.readFileSync(file));
-  return import(`${pathToFileURL(file).href}?selftest=${sha}`);
-}
-
-function evalBuiltBlock(tree, rel, id, opts) {
-  return evalBlock(extractBlock(fs.readFileSync(path.join(tree, rel), "utf8"), id), id, opts);
-}
-
-const expectThrow = (fn) => { try { fn(); return false; } catch { return true; } };
 
 /** Functional checks: id -> list of {name, run(tree, env) -> detail string (throws on failure)}. */
 export const FUNCTIONAL_CHECKS = {
@@ -88,6 +80,17 @@ export const FUNCTIONAL_CHECKS = {
       if (!refused) throw new Error("a run with cwd /etc was not refused");
       return "network restored, LD_PRELOAD dropped, cwd /etc refused";
     },
+  }, {
+    name: "a run cannot move a boxed agent to the engine the box never sees (0003b)",
+    async run(tree, env) {
+      const b = evalBuiltBlock(tree, HEARTBEAT_FILE, "0003", env);
+      const stored = { filesystemScope: "workspace", networkScope: "allowlist", networkAllowlist: ["api.anthropic.com"], engine: "cli", env: {} };
+      const out = await b.enforceStoredSandboxConfig({ agent: { id: "selftest-agent", adapterType: "claude_local", adapterConfig: stored }, runId: "selftest-run", workspaceDirs: [], managedAi: false,
+        runtimeConfig: { engine: "acp", env: { XDG_CONFIG_HOME: "/tmp/elsewhere" } } });
+      if (out.engine !== "cli") throw new Error(`the run's engine override "${out.engine}" was kept`);
+      if ("XDG_CONFIG_HOME" in (out.env ?? {})) throw new Error("a run-level XDG_CONFIG_HOME redirect was kept");
+      return "engine override restored to cli, XDG redirect dropped";
+    },
   }],
   "safe-defaults": [{
     name: "a new unboxed agent starts boxed without create rights (0005a)",
@@ -103,6 +106,9 @@ export const FUNCTIONAL_CHECKS = {
       return "boxed (workspace + allowlist) on the CLI engine, canCreateAgents/canCreateSkills false";
     },
   }],
+  "box-claude": BOX_CLAUDE_CHECKS,
+  "box-opencode": BOX_OPENCODE_CHECKS,
+  "only-boxed": ADMISSION_CHECKS,
 };
 
 /** Structural check of one protection: its files equal the recorded built sha and carry the markers of its patches. */
@@ -131,20 +137,25 @@ export function structuralCheck(protection, statusFiles, tree) {
  * @param {object} o.status   engine.status() result (only protections with status "applied" are tested)
  * @param {object} [o.env]    environment the patched blocks see (the variables of the target Paperclip that they read)
  * @param {string} o.instanceRoot  the target's instance root (what resolvePaperclipInstanceRoot() returns in Paperclip)
+ * @param {string} [o.userHome]     home directory of the account Paperclip runs as (the box probes check that it stays out of reach)
  * @param {object} [o.checks] functional checks (tests pass their own)
+ * @param {object} [o.upstream] {protectionId: [patch ids]} protections whose change is now part of Paperclip (their patches were not
+ *                              applied, so there is no marker block for a functional check to load): counted as satisfied, no functional check
  * @returns {Promise<{at: string, results: object}>}  results[id] = {ok, mode, checks, filesKey}
  */
-export async function runSelfTest({ engine, status, env = {}, instanceRoot, checks = FUNCTIONAL_CHECKS, now = () => new Date() }) {
+export async function runSelfTest({ engine, status, env = {}, instanceRoot, userHome = null, checks = FUNCTIONAL_CHECKS, upstream = {}, now = () => new Date() }) {
   if (!instanceRoot) throw new Error("runSelfTest needs the instance root of the target Paperclip");
   const tree = status.tree ?? engine.tree;
-  const blockEnv = { env, instanceRoot };
+  const blockEnv = { env, instanceRoot, userHome };
   const results = {};
   const byId = Object.fromEntries(engine.protections().map((p) => [p.id, p]));
   for (const st of status.protections) {
     const p = byId[st.id];
     if (!p || p.kind !== "patch" || st.status !== "applied") continue;
     const list = [];
-    for (const c of checks[p.id] ?? []) {
+    const nowUpstream = Array.isArray(upstream?.[p.id]) && upstream[p.id].length > 0;
+    if (nowUpstream) list.push({ name: "the change is now part of Paperclip", kind: "upstream", ok: true, detail: `${upstream[p.id].join(", ")}: no longer needed, no functional check` });
+    for (const c of nowUpstream ? [] : checks[p.id] ?? []) {
       try { list.push({ name: c.name, kind: "functional", ok: true, detail: await c.run(tree, blockEnv) }); }
       catch (e) { list.push({ name: c.name, kind: "functional", ok: false, detail: e?.message ?? String(e) }); }
     }

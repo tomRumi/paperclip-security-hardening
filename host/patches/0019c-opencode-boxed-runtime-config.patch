@@ -1,0 +1,63 @@
+--- a/node_modules/@paperclipai/adapter-opencode-local/dist/server/runtime-config.js
++++ b/node_modules/@paperclipai/adapter-opencode-local/dist/server/runtime-config.js
+@@ -86,6 +86,23 @@
+         return {};
+     }
+ }
++// LOCAL-PATCH 0019c: a sandboxed agent's run (boxedRuntimeDir is its runtime dir, set by 0019) takes everything from the AGENT's env:
++// {env:NAME} placeholders of the provider config, the provider config itself and the small model never fall back to the server's
++// process.env (a config the agent controls could otherwise bake a server secret into the file the CLI reads). A placeholder with no
++// value in the agent's env is refused up front, before anything is created. The config copy is made in the runtime dir, which the box
++// mounts, instead of the system temp dir.
++const ENV_PLACEHOLDER = /\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g;
++function assertBoxedProviderPlaceholders(env) {
++    const raw = env.PAPERCLIP_OPENCODE_PROVIDERS;
++    if (typeof raw !== "string")
++        return;
++    for (const match of raw.matchAll(ENV_PLACEHOLDER)) {
++        const value = env[match[1]];
++        if (typeof value !== "string" || value.length === 0) {
++            throw new Error(`PAPERCLIP_OPENCODE_PROVIDERS refers to {env:${match[1]}}, which is not set in this agent's own env. A sandboxed OpenCode agent never reads the server's environment: add ${match[1]} to the agent's env (a company secret) or remove the placeholder.`);
++        }
++    }
++}
+ export async function prepareOpenCodeRuntimeConfig(input) {
+     const skipPermissions = asBoolean(input.config.dangerouslySkipPermissions, true);
+     if (!skipPermissions) {
+@@ -107,8 +124,14 @@
+             cleanup: async () => { },
+         };
+     }
++    const boxedRuntimeDir = typeof input.boxedRuntimeDir === "string" && input.boxedRuntimeDir.length > 0 ? input.boxedRuntimeDir : null; // LOCAL-PATCH 0019c
++    if (boxedRuntimeDir)
++        assertBoxedProviderPlaceholders(input.env);
+     const sourceConfigDir = path.join(resolveXdgConfigHome(input.env), "opencode");
+-    const runtimeConfigHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-config-"));
++    const configParent = boxedRuntimeDir ? path.join(boxedRuntimeDir, "state") : os.tmpdir(); // LOCAL-PATCH 0019c
++    if (boxedRuntimeDir)
++        await fs.mkdir(configParent, { recursive: true, mode: 0o700 });
++    const runtimeConfigHome = await fs.mkdtemp(path.join(configParent, "paperclip-opencode-config-"));
+     const runtimeConfigDir = path.join(runtimeConfigHome, "opencode");
+     const runtimeConfigPath = path.join(runtimeConfigDir, "opencode.json");
+     await fs.mkdir(runtimeConfigDir, { recursive: true });
+@@ -136,8 +159,9 @@
+     // gateway model (e.g. an EU LLM gateway exposing OpenAI-compatible /v1) requires a
+     // custom provider with an explicit models map. We accept it as config (not
+     // hard-coded) so the gateway URL, key env, and model list stay declarative.
+-    const resolveEnv = (name) => input.env[name] ?? process.env[name];
+-    const gatewayProviders = parseProviderConfig(input.env.PAPERCLIP_OPENCODE_PROVIDERS ?? process.env.PAPERCLIP_OPENCODE_PROVIDERS, resolveEnv, notes);
++    const serverEnv = (name) => (boxedRuntimeDir ? undefined : process.env[name]); // LOCAL-PATCH 0019c: a sandboxed agent never reads the server's env
++    const resolveEnv = (name) => input.env[name] ?? serverEnv(name);
++    const gatewayProviders = parseProviderConfig(input.env.PAPERCLIP_OPENCODE_PROVIDERS ?? serverEnv("PAPERCLIP_OPENCODE_PROVIDERS"), resolveEnv, notes);
+     const existingProvider = isPlainObject(existingConfig.provider) ? existingConfig.provider : {};
+     let nextProvider = gatewayProviders
+         ? { ...existingProvider, ...gatewayProviders }
+@@ -181,7 +205,7 @@
+     // for the anthropic provider); when that provider is repointed at a gateway that
+     // does not serve that exact model, the title-gen call fails and aborts the run.
+     // Setting small_model to a gateway-served model keeps every call on supported models.
+-    const smallModel = (input.env.PAPERCLIP_OPENCODE_SMALL_MODEL ?? process.env.PAPERCLIP_OPENCODE_SMALL_MODEL)?.trim();
++    const smallModel = (input.env.PAPERCLIP_OPENCODE_SMALL_MODEL ?? serverEnv("PAPERCLIP_OPENCODE_SMALL_MODEL"))?.trim();
+     if (smallModel) {
+         nextConfig.small_model = smallModel;
+         notes.push(`Pinned OpenCode small_model to ${smallModel}.`);

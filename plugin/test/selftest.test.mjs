@@ -15,8 +15,8 @@ test.after(() => { if (!skip) S.cleanup(); });
 const actor = (type, userId, companyId = "c1") => ({ actor: Object.freeze({ type, userId, agentId: type === "agent" ? "a1" : null, runId: null, companyId }), companyId });
 const ADMIN = actor("user", "u-admin");
 const AGENT = actor("agent", null);
-const DEFAULTS = ["sandbox-compat", "own-box", "only-boxed", "safe-defaults", "no-permission-handing", "pipeline-board-only", "assign-needs-grant", "public-web", "own-claude-folder"];
-const FUNCTIONAL = ["sandbox-compat", "own-box", "safe-defaults", "public-web"];
+const DEFAULTS = ["sandbox-compat", "own-box", "only-boxed", "safe-defaults", "no-permission-handing", "pipeline-board-only", "assign-needs-grant", "public-web", "own-claude-folder", "box-claude", "box-opencode"];
+const FUNCTIONAL = ["sandbox-compat", "own-box", "safe-defaults", "public-web", "box-claude", "box-opencode", "only-boxed"];
 const usrMerged = (() => { try { return fs.lstatSync("/bin").isSymbolicLink(); } catch { return false; } })();
 
 function fakeCtx({ alertCompanyId = "c1", issuesFail = false } = {}) {
@@ -47,7 +47,7 @@ test("functional checks fail on Paperclip's original files (they test behaviour,
   } finally { f.cleanup(); }
 });
 
-test("after a restart every applied protection passes; four are functional, the rest structural only", { skip }, async () => {
+test("after a restart every applied protection passes; six are functional, the rest structural only", { skip }, async () => {
   const f = S.fresh();
   try {
     const fk = fakeCtx();
@@ -84,12 +84,15 @@ test("after a restart every applied protection passes; four are functional, the 
     assert.equal(rows["pipeline-board-only"].selfTest.mode, "structural only");
     assert.equal(st.selfTest.waitingRestart, false);
 
-    // A later change of the protection's files invalidates the stored result (status no longer claims a pass).
-    assert.equal((await h.applyChange({ enabled: DEFAULTS.filter((id) => id !== "public-web") }, ADMIN)).ok, true);
+    // A later change of the protection's files invalidates the stored result (status no longer claims a pass). Switching the
+    // public-web box off also switches off what is built on it (the box for Claude and OpenCode agents); the admission rule is switched off here too (it would keep the Claude box, and so public-web, on).
+    assert.equal((await h.applyChange({ enabled: DEFAULTS.filter((id) => id !== "public-web" && id !== "only-boxed"), confirmCoreOff: true }, ADMIN)).ok, true);
     started = new Date(Date.now() + 120000).toISOString();
     const rows2 = byId((await h.getStatus()).protections);
     assert.equal(rows2["sandbox-compat"].selfTest, null, "local-process-sandbox.js was rebuilt");
-    assert.equal(rows2["own-box"].selfTest.ok, true, "own-box's files are unchanged");
+    assert.equal(rows2["own-box"].selfTest, null, "heartbeat.js was rebuilt without the admission rule");
+    assert.equal(rows2["no-permission-handing"].selfTest, null, "routes/agents.js was rebuilt without the board-only test route (only boxed agents run)");
+    assert.equal(rows2["pipeline-board-only"].selfTest.ok, true, "its files are unchanged");
   } finally { f.cleanup(); }
 });
 
@@ -168,5 +171,34 @@ test("structural check: a file whose sha256 is not the engine's built one, or th
     fs.writeFileSync(`${dir}/a.js`, "x\n");
     const lost = structuralCheck(p, [{ rel: "a.js", currentSha: "s1", builtSha: "s1", patches: ["0007"] }], dir);
     assert.match(lost.detail, /marker missing for 0007/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a protection that is now part of Paperclip counts as satisfied: no functional check, no failure for the missing marker block (fail-before: it failed)", async () => {
+  const dir = fs.mkdtempSync(`${process.env.HARDENING_TEST_SCRATCH ?? "/tmp"}/selftest-upstream-`);
+  try {
+    fs.writeFileSync(`${dir}/a.js`, "paperclip's own code, no marker\n");
+    const p = { id: "no-permission-handing", kind: "patch", patches: ["0009"], files: ["a.js"] };
+    const engine = { tree: dir, protections: () => [p] };
+    const status = { tree: dir, protections: [{ id: p.id, status: "applied" }], files: [{ rel: "a.js", currentSha: "s1", builtSha: "s1", patches: [] }] };
+    const checks = { [p.id]: [{ name: "loads the 0009 block", run: async () => { throw new Error("no LOCAL-PATCH 0009 block in the file"); } }] };
+    const without = await runSelfTest({ engine, status, instanceRoot: "/x", checks });
+    assert.equal(without.results[p.id].ok, false, "without the upstream note the functional check fails");
+    const withNote = await runSelfTest({ engine, status, instanceRoot: "/x", checks, upstream: { [p.id]: ["0009"] } });
+    assert.equal(withNote.results[p.id].ok, true);
+    assert.deepEqual(withNote.results[p.id].checks.map((c) => [c.kind, c.ok]), [["upstream", true], ["structural", true]]);
+    // the hardening passes the stored note on
+    const seen = [];
+    const fk = fakeCtx();
+    fk.state.set("instance::now-upstream", { signature: "s", protections: [{ id: p.id, title: "t", patches: ["0009"] }] });
+    const S2 = S.skip ? null : S.fresh();
+    if (S2) {
+      try {
+        const h = createHardening({ ctx: fk.ctx, ...S2.hardening, serverStartedAt: () => new Date(Date.now() + 60000).toISOString(), runSelfTestFn: async (o) => { seen.push(o.upstream); return { at: new Date().toISOString(), results: {} }; } });
+        await h.applyChange({ enabled: ["sandbox-compat"] }, ADMIN);
+        await h.selfTestAfterStart();
+        assert.deepEqual(seen, [{ [p.id]: ["0009"] }]);
+      } finally { S2.cleanup(); }
+    }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

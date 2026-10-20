@@ -4,7 +4,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHardening, NotAllowedError, SETTINGS_KEY } from "../src/hardening.js";
 import { register, BOX_ACTIONS } from "../src/worker.js";
-import { createBoxes, buildBoxPatch, takeOverFrom, currentBox, normalizeBoxInput, syncState, assertNoRedacted, BOXES_KEY, PUBLIC_WEB, APPLY_UNSUPPORTED } from "../src/boxes.js";
+import { createBoxes, effectiveBase, buildBoxPatch, takeOverFrom, currentBox, normalizeBoxInput, syncState, assertNoRedacted, BOXES_KEY, PUBLIC_WEB, APPLY_UNSUPPORTED } from "../src/boxes.js";
 import { createCaps } from "../src/caps.js";
 import { fakeTarget, hardeningFor as hardeningTarget } from "./helpers/scratch-tree.mjs";
 
@@ -222,4 +222,64 @@ test("rows carry today's usage against the cap (caps view)", async () => {
   assert.equal(v.caps.fromTemplate, true);
   assert.deepEqual(v.rows[0].cap, { cap: 600000, override: null, reported: false, used: null, error: null, pausedByCap: false });
   assert.equal(syncState(claude("x", "X", { networkAllowlist: ["api.anthropic.com"], filesystemExtraPaths: [] }), buildBoxPatch({ mode: "allowlist", extraHosts: [], extraPaths: [] }, {})), "in-sync");
+});
+
+// ---------- v0.2.0: opencode_local is boxable; per-type state, findings and the fix PATCH on the rows
+const opencode = (id, name, cfg = {}) => ({ ...claude(id, name, {}), adapterType: "opencode_local", adapterConfig: { model: "openrouter/x", filesystemScope: "workspace", filesystemSandboxCommand: "/usr/bin/bwrap", networkScope: "allowlist", networkAllowlist: [R], ...cfg } });
+const other = (id, adapterType, cfg = {}) => ({ id, companyId: "c1", name: id, role: "engineer", status: "idle", adapterType, permissions: {}, adapterConfig: cfg });
+
+test("opencode_local base: baseAllowlists[type], else the profile's common LLM hosts (no single provider); claude keeps baseAllowlist", () => {
+  assert.deepEqual(effectiveBase({}, "opencode_local").hosts, ["openrouter.ai", "api.anthropic.com", "api.openai.com", "generativelanguage.googleapis.com"]);
+  assert.deepEqual(effectiveBase({ baseAllowlists: { opencode_local: ["openrouter.ai"] }, baseAllowlist: ["x.example"] }, "opencode_local").hosts, ["openrouter.ai"]);
+  assert.deepEqual(effectiveBase({ baseAllowlist: ["x.example"], baseAllowlists: { opencode_local: ["openrouter.ai"] } }).hosts, ["x.example"]);
+  const p = buildBoxPatch({ mode: "allowlist", extraHosts: ["pypi.org"], extraPaths: [] }, { baseAllowlists: { opencode_local: ["openrouter.ai"] } }, "opencode_local");
+  assert.deepEqual(p.adapterConfig.networkAllowlist, ["openrouter.ai", "pypi.org"]);
+});
+
+test("rows: opencode_local is boxable and can be taken over; its findings and the fix PATCH are shown, never written", async () => {
+  const bad = opencode("o1", "Coder", { filesystemScope: undefined, filesystemSandboxCommand: undefined, networkScope: undefined, networkAllowlist: undefined, env: { HOME: "/x", XDG_CACHE_HOME: "/y", OPENCODE_CONFIG: "/z", OPENROUTER_API_KEY: { type: "secret_ref" } } });
+  const good = opencode("o2", "Clean", {});
+  const fk = fakeCtx({ agents: [bad, good], settings: { baseAllowlists: { opencode_local: ["openrouter.ai"] } } });
+  const { b, sent } = service(fk);
+  const rows = Object.fromEntries((await b.view({}, ADMIN)).rows.map((r) => [r.id, r]));
+  assert.equal(rows.o1.boxable, true);
+  assert.equal(rows.o1.typeState, "boxed");
+  assert.match(rows.o1.findings.join(), /filesystemScope/);
+  assert.deepEqual(rows.o1.dropEnv, ["HOME", "XDG_CACHE_HOME", "OPENCODE_CONFIG"]);
+  assert.match(rows.o1.findings.join(), /filesystemSandboxCommand is not an absolute path/);
+  assert.deepEqual(rows.o1.fix, { adapterConfig: { filesystemScope: "workspace", filesystemSandboxCommand: "/usr/bin/bwrap", networkScope: "allowlist", networkAllowlist: ["openrouter.ai"] } });
+  assert.equal(rows.o2.fix, null, "an agent that already has the keys gets no fix");
+  assert.ok(!JSON.stringify(rows).includes("REDACTED"));
+  assert.equal(sent.length, 0);
+  // Taken over, the fix carries the plugin's lists (base plus extras).
+  assert.equal((await b.takeOver({ agentId: "o1" }, ADMIN)).ok, true);
+  assert.equal((await b.saveBox({ agentId: "o1", mode: "allowlist", extraHosts: "pypi.org" }, ADMIN)).ok, true);
+  const after = (await b.view({}, ADMIN)).rows.find((r) => r.id === "o1");
+  assert.deepEqual(after.fix.adapterConfig.networkAllowlist, ["openrouter.ai", "pypi.org"]);
+});
+
+test("rows: claude_local without engine cli gets the engine in its fix PATCH", async () => {
+  const fk = fakeCtx({ agents: [claude("a1", "Engineer", { networkAllowlist: ["api.anthropic.com"], filesystemSandboxCommand: "/usr/bin/bwrap", engine: "acp" })] });
+  const { b } = service(fk);
+  const row = (await b.view({}, ADMIN)).rows[0];
+  assert.match(row.findings.join(), /engine is not 'cli'/);
+  assert.deepEqual(row.fix, { adapterConfig: { engine: "cli" } });
+});
+
+test("rows: the other adapter types show what this version does with them", async () => {
+  const exc = [{ agentId: "r2", type: "http", reason: "r", addedBy: "u", addedAt: "2026-10-20T00:00:00.000Z" }];
+  const fk = fakeCtx({ agents: [other("c1x", "codex_local"), other("r1", "http"), other("r2", "http"), other("r3", "paperclip_runner"), other("h1", "hermes_local", { command: "/usr/local/bin/hermes-sandbox" })],
+    settings: { remoteExceptions: exc } });
+  const { b } = service(fk);
+  const rows = Object.fromEntries((await b.view({}, ADMIN)).rows.map((r) => [r.id, r]));
+  assert.equal(rows.c1x.typeState, "later-version");
+  assert.match(rows.c1x.typeNote, /planned for a later version/);
+  assert.equal(rows.r1.typeState, "exception-needed");
+  assert.match(rows.r1.typeNote, /needs a remote exception/);
+  assert.equal(rows.r2.typeState, "excepted");
+  assert.deepEqual(rows.r2.findings, []);
+  assert.equal(rows.r3.typeState, "unsupported");
+  assert.equal(rows.h1.typeState, "hermes-wrapper");
+  for (const id of ["c1x", "r1", "r2", "r3", "h1"]) { assert.equal(rows[id].boxable, false); assert.equal(rows[id].fix, null); }
+  assert.match((await b.takeOver({ agentId: "c1x" }, ADMIN)).error, /no box the plugin can manage/);
 });

@@ -87,6 +87,54 @@ test("saveSettings: validates, stores, writes config.json (0600, only non-empty 
   assert.deepEqual((await h.loadSettings()).baseAllowlist, ["api.anthropic.com", "10.0.0.5:3100"]);
 });
 
+test("remote exceptions and the OpenCode base allowlist: admin-only writes through saveSettings; addedBy/addedAt are set by the worker; every change is logged", async () => {
+  const { ctx, reg, logs } = fakeCtx();
+  const file = path.join(tmp, "x", "hardening", "config.json");
+  const h = createHardening({ ctx, createEngineFn: noEngine, ...hardeningFor(fakeTarget({ configPath: file })) });
+  register(ctx, { hardening: h });
+  const save = (settings, who) => reg.actions.saveSettings({ settings }, who);
+  const e1 = { agentId: "r1", type: "http", reason: "webhook relay, reviewed 2026-10" };
+  // Agents, system calls and users who are not admins are refused; nothing is written or logged.
+  for (const who of [AGENT, actor("system", null), MEMBER]) {
+    await assert.rejects(save({ remoteExceptions: [e1] }, who), NotAllowedError);
+  }
+  assert.equal(fs.existsSync(file), false);
+  assert.equal(logs.length, 0);
+  // An admin adds one; a spoofed addedBy/addedAt in the request is replaced.
+  const spoof = { ...e1, addedBy: "someone-else", addedAt: "2001-01-01T00:00:00Z" };
+  const r = await save({ remoteExceptions: [spoof], baseAllowlists: { opencode_local: "openrouter.ai\napi.anthropic.com" } }, ADMIN);
+  assert.equal(r.ok, true, JSON.stringify(r.errors));
+  assert.equal(r.settings.remoteExceptions[0].addedBy, "u-admin");
+  assert.notEqual(r.settings.remoteExceptions[0].addedAt, spoof.addedAt);
+  const written = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.deepEqual(written.baseAllowlists, { opencode_local: ["openrouter.ai", "api.anthropic.com"] });
+  assert.deepEqual(written.remoteExceptions, r.settings.remoteExceptions);
+  const added = logs.filter((l) => /remote exception added/.test(l.message));
+  assert.equal(added.length, 1);
+  assert.match(added[0].message, /http agent r1/);
+  assert.equal(added[0].metadata.userId, "u-admin");
+  assert.equal(added[0].metadata.reason, e1.reason);
+  // Saving the same list again keeps the stamp and logs nothing new.
+  const stamp = r.settings.remoteExceptions[0];
+  const again = await save({ remoteExceptions: [e1] }, ADMIN);
+  assert.deepEqual(again.settings.remoteExceptions, [stamp]);
+  assert.equal(logs.filter((l) => /remote exception/.test(l.message)).length, 1);
+  // A type that cannot be excepted is rejected with the error; nothing changes.
+  const bad = await save({ remoteExceptions: [{ agentId: "r2", type: "codex_local", reason: "no" }] }, ADMIN);
+  assert.equal(bad.ok, false);
+  assert.match(bad.errors.join(), /type must be one of/);
+  assert.deepEqual((await h.loadSettings()).remoteExceptions, [stamp]);
+  // An agent cannot remove it either; an admin can, and the removal is logged.
+  await assert.rejects(save({ remoteExceptions: [] }, AGENT), NotAllowedError);
+  assert.deepEqual((await h.loadSettings()).remoteExceptions, [stamp]);
+  assert.equal((await save({ remoteExceptions: [] }, ADMIN)).ok, true);
+  assert.deepEqual((await h.loadSettings()).remoteExceptions, []);
+  assert.equal(logs.filter((l) => /remote exception removed for http agent r1/.test(l.message)).length, 1);
+  // A save without the field changes no exception, so logs none.
+  assert.equal((await save({ alertCompanyId: "c1" }, ADMIN)).ok, true);
+  assert.equal(logs.filter((l) => /remote exception/.test(l.message)).length, 2, "added once, removed once");
+});
+
 test("saveSettings: a settings file location the server would not trust is refused; nothing is stored or written", async () => {
   const { ctx, state } = fakeCtx();
   const instanceRoot = path.join(tmp, "c");
@@ -163,7 +211,7 @@ test("applyChange: admin only, refuses core switch-off without confirmation, log
     assertPristine(f.tree, "after refused calls");
     assert.equal(logs.length, 0);
 
-    const defaults = ["sandbox-compat", "own-box", "only-boxed", "safe-defaults", "no-permission-handing", "pipeline-board-only", "assign-needs-grant", "public-web", "own-claude-folder"];
+    const defaults = ["sandbox-compat", "own-box", "only-boxed", "safe-defaults", "no-permission-handing", "pipeline-board-only", "assign-needs-grant", "public-web", "own-claude-folder", "box-claude", "box-opencode"];
     const on = await h.applyChange({ enabled: defaults }, ADMIN);
     assert.equal(on.ok, true, on.error);
     assert.ok(on.changed.length > 0);
@@ -252,14 +300,15 @@ test("start: writes config.json, leaves an unmanaged or apply.sh-patched tree al
     assert.deepEqual(JSON.parse(fs.readFileSync(f.configPath, "utf8")).baseAllowlist, ["api.anthropic.com"]);
     assertPristine(f.tree, "after start on an unmanaged tree");
 
-    // A tree patched by apply.sh (live files + .orig): nothing switched on in the engine, so start must not touch it.
+    // A tree patched by apply.sh (patched files + .orig): nothing switched on in the engine, so start must not touch it.
     const g = S.fresh();
     try {
-      for (const rel of S.targets) { fs.copyFileSync(path.join(S.live, rel), path.join(g.tree, rel)); fs.copyFileSync(path.join(S.live, `${rel}.orig`), path.join(g.tree, `${rel}.orig`)); }
+      const patchedBy = (rel) => Buffer.concat([S.baseFile(rel), Buffer.from("\n// LOCAL-PATCH 9999 simulated apply.sh patch\n")]);
+      for (const rel of S.targets) { fs.writeFileSync(path.join(g.tree, rel), patchedBy(rel)); fs.writeFileSync(path.join(g.tree, `${rel}.orig`), S.baseFile(rel)); }
       const hg = createHardening({ ctx: fakeCtx().ctx, ...g.hardening });
       assert.equal((await hg.start()).applied, false);
       assert.equal(fs.existsSync(g.configPath), false, "no settings saved yet: the settings file is not written");
-      for (const rel of S.targets) assert.ok(read(g.tree, rel).equals(read(S.live, rel)), `${rel}: start changed an apply.sh-patched file`);
+      for (const rel of S.targets) assert.ok(read(g.tree, rel).equals(patchedBy(rel)), `${rel}: start changed an apply.sh-patched file`);
     } finally { g.cleanup(); }
 
     // Managed tree, then a Paperclip update replaces one target file with a new unpatched version.

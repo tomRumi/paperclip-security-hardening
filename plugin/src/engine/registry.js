@@ -6,7 +6,10 @@
 //   "plugin-job"   runs inside the plugin (no Paperclip files change)
 //   "host-install" installed outside Paperclip by the admin's one-line install (no Paperclip files change)
 // core: switching it off must be confirmed by the owner; `risk` is the sentence the confirmation shows.
-// requires: protections that are switched on automatically together with this one.
+// requires: protections that are switched on automatically together with this one AND without which this one cannot work
+//           (a broken combination): if one of them does not fit this Paperclip, this one is unavailable too.
+// softRequires: protections that are switched on together with this one by default, but this one still applies when they
+//           do not fit this Paperclip (and switching one of them off does not switch this one off).
 
 export const PROTECTIONS = [
   {
@@ -29,19 +32,54 @@ export const PROTECTIONS = [
     kind: "patch",
     core: true,
     risk: "An agent could widen its own sandbox or network, change its commands or rewrite its instructions.",
-    patches: ["0002", "0003", "0008"],
+    patches: ["0002", "0003", "0003b", "0008"],
     requires: ["sandbox-compat"],
+    defaultOn: true,
+  },
+  {
+    id: "box-claude",
+    title: "Box Claude agents",
+    description:
+      "Claude agents run in the sandbox with their own folders, and the server's own secrets (database, keys) are not passed to them. Only what the agent itself is given (its secrets and run variables) reaches the run. This also sets up the shared sandbox helper that OpenCode agents use.",
+    kind: "patch",
+    core: true,
+    risk: "Claude agents could run with the server's environment, including its database and API secrets, or fail to start inside the sandbox.",
+    // The shared box helper builds on the public-web patch and the Claude adapter on the own-Claude-folder patch (their code is
+    // changed further). The environment scrub must not be on without the Claude adapter (a boxed Claude agent would lose its
+    // credentials): that is why they are one switch. "only-boxed" switches it on by default (softRequires) but does not need it.
+    patches: ["0017", "0025", "0026", "0026b", "0026c"],
+    requires: ["sandbox-compat", "public-web", "own-claude-folder"],
+    defaultOn: true,
+  },
+  {
+    id: "box-opencode",
+    title: "Box OpenCode agents",
+    description:
+      "OpenCode agents run in the sandbox with their own folders and a cleared environment, like Claude agents. While this is off, OpenCode agents are refused by \"Only boxed agents run\" instead of running.",
+    kind: "patch",
+    core: false,
+    // Not core: with it off (or when its patches stop fitting a new Paperclip) OpenCode agents lose nothing that was protecting them,
+    // they are refused ("Only boxed agents run" admits a type only when its adapter registered itself as boxed), so switching it
+    // off or losing it on an update fails closed. It uses the shared box helper and the environment scrub of "box-claude".
+    patches: ["0019", "0019b", "0019c", "0019d"],
+    requires: ["box-claude"],
     defaultOn: true,
   },
   {
     id: "only-boxed",
     title: "Only boxed agents run",
-    description: "An agent without a sandbox is refused instead of running unboxed.",
+    description:
+      "An agent without a sandbox is refused instead of running unboxed, and an agent cannot start the \"Test environment\" probe (which runs outside the sandbox). Boxed Claude agents run, and boxed OpenCode agents while \"Box OpenCode agents\" is on; other agent types are refused for now.",
     kind: "patch",
     core: true,
     risk: "An agent without a sandbox would run with full access to this server's account.",
-    patches: ["0005b"],
-    requires: ["sandbox-compat"],
+    patches: ["0005b", "0005f", "0027"],
+    // The admission rule reads the stored box that "own-box" keeps intact, and refuses a boxed agent whose adapter is not
+    // set up by "box-claude" (or "box-opencode" for OpenCode: a type is admitted only when its adapter registered itself as boxed).
+    // "box-claude" is a soft dependency: when it does not fit a new Paperclip the rule still applies and refuses Claude agents
+    // (they are not registered as boxed), which fails closed; an agent without any sandbox is never admitted either way.
+    requires: ["sandbox-compat", "own-box"],
+    softRequires: ["box-claude"],
     defaultOn: true,
   },
   {
@@ -149,12 +187,14 @@ export const PATCHES = {
   "0001": { marker: "// LOCAL-PATCH 0001" },
   "0002": { marker: "// LOCAL-PATCH 0002" },
   "0003": { marker: "// LOCAL-PATCH 0003" },
+  "0003b": { marker: "// LOCAL-PATCH 0003b" },
   "0004": { marker: "// LOCAL-PATCH 0004" },
   "0005a": { marker: "// LOCAL-PATCH 0005a" },
   "0005b": { marker: "// LOCAL-PATCH 0005b" },
   "0005c": { marker: "// LOCAL-PATCH 0005c" },
   "0005d": { marker: "// LOCAL-PATCH 0005d" },
   "0005e": { marker: "// LOCAL-PATCH 0005e", notNeededOn: ["1005"] },
+  "0005f": { marker: "// LOCAL-PATCH 0005f" },
   "0006a": { marker: "// LOCAL-PATCH 0006" },
   "0006b": { marker: "// LOCAL-PATCH 0006" },
   "0007": { marker: "// LOCAL-PATCH 0007" },
@@ -169,6 +209,16 @@ export const PATCHES = {
   "0014": { marker: "// LOCAL-PATCH 0014" },
   "0015": { marker: "// LOCAL-PATCH 0015" },
   "0016": { marker: "// LOCAL-PATCH 0016" },
+  "0017": { marker: "// LOCAL-PATCH 0017" },
+  "0019": { marker: "// LOCAL-PATCH 0019" },
+  "0019b": { marker: "// LOCAL-PATCH 0019b" },
+  "0019c": { marker: "// LOCAL-PATCH 0019c" },
+  "0019d": { marker: "// LOCAL-PATCH 0019d" },
+  "0025": { marker: "// LOCAL-PATCH 0025" },
+  "0026": { marker: "// LOCAL-PATCH 0026" },
+  "0026b": { marker: "// LOCAL-PATCH 0026b" },
+  "0026c": { marker: "// LOCAL-PATCH 0026c" },
+  "0027": { marker: "// LOCAL-PATCH 0027" },
 };
 
 /** Any engine-made change carries this text; a target file without a stored pristine that contains it was patched by

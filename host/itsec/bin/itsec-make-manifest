@@ -24,16 +24,25 @@ import sys
 import tempfile
 
 TREE_TARGETS = [   # same table as patches/apply.sh (a test keeps them identical)
-    ("node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js", ["// LOCAL-PATCH 0001", "// LOCAL-PATCH 0004", "// LOCAL-PATCH 0006", "// LOCAL-PATCH 0012"]),
-    ("node_modules/@paperclipai/server/dist/routes/agents.js", ["// LOCAL-PATCH 0002", "// LOCAL-PATCH 0005c", "// LOCAL-PATCH 0009", "// LOCAL-PATCH 0011", "// LOCAL-PATCH 0013"]),
-    ("node_modules/@paperclipai/server/dist/routes/pipelines.js", ["// LOCAL-PATCH 0007"]),
-    ("node_modules/@paperclipai/server/dist/services/heartbeat.js", ["// LOCAL-PATCH 0003", "// LOCAL-PATCH 0005b", "// LOCAL-PATCH 0006"]),
+    ("node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js", ["// LOCAL-PATCH 0001", "// LOCAL-PATCH 0004", "// LOCAL-PATCH 0006", "// LOCAL-PATCH 0012", "// LOCAL-PATCH 0015", "// LOCAL-PATCH 0017"]),
+    ("node_modules/@paperclipai/server/dist/routes/agents.js", ["// LOCAL-PATCH 0002", "// LOCAL-PATCH 0005c", "// LOCAL-PATCH 0009", "// LOCAL-PATCH 0011", "// LOCAL-PATCH 0013", "// LOCAL-PATCH 0027"]),
+    ("node_modules/@paperclipai/server/dist/services/heartbeat.js", ["// LOCAL-PATCH 0003", "// LOCAL-PATCH 0003b", "// LOCAL-PATCH 0005b", "// LOCAL-PATCH 0005f", "// LOCAL-PATCH 0006"]),
     ("node_modules/@paperclipai/server/dist/services/agents.js", ["// LOCAL-PATCH 0005a", "// LOCAL-PATCH 0008"]),
     ("node_modules/@paperclipai/server/dist/services/company-portability.js", ["// LOCAL-PATCH 0005d"]),
     ("node_modules/@paperclipai/server/dist/services/agent-permissions.js", ["// LOCAL-PATCH 0005e"]),
+    ("node_modules/@paperclipai/server/dist/routes/pipelines.js", ["// LOCAL-PATCH 0007"]),
     ("node_modules/@paperclipai/server/dist/services/built-in-agents.js", ["// LOCAL-PATCH 0010"]),
-    ("node_modules/@paperclipai/server/dist/services/authorization.js", ["// LOCAL-PATCH 0013"]),
     ("node_modules/@paperclipai/shared/dist/validators/agent.js", ["// LOCAL-PATCH 0011"]),
+    ("node_modules/@paperclipai/server/dist/services/authorization.js", ["// LOCAL-PATCH 0013"]),
+    ("node_modules/@paperclipai/server/dist/modules/run-dispatch/adapters/postgres.js", ["// LOCAL-PATCH 0014"]),
+    ("node_modules/@paperclipai/adapter-claude-local/dist/server/execute.js", ["// LOCAL-PATCH 0016", "// LOCAL-PATCH 0026"]),
+    ("node_modules/@paperclipai/adapter-opencode-local/dist/server/execute.js", ["// LOCAL-PATCH 0019"]),
+    ("node_modules/@paperclipai/adapter-opencode-local/dist/server/models.js", ["// LOCAL-PATCH 0019b"]),
+    ("node_modules/@paperclipai/adapter-opencode-local/dist/server/runtime-config.js", ["// LOCAL-PATCH 0019c"]),
+    ("node_modules/@paperclipai/adapter-opencode-local/dist/server/test.js", ["// LOCAL-PATCH 0019d"]),
+    ("node_modules/@paperclipai/adapter-utils/dist/server-utils.js", ["// LOCAL-PATCH 0025"]),
+    ("node_modules/@paperclipai/adapter-claude-local/dist/server/test.js", ["// LOCAL-PATCH 0026b"]),
+    ("node_modules/@paperclipai/adapter-claude-local/dist/server/acp.js", ["// LOCAL-PATCH 0026c"]),
 ]
 # apply.sh skips these for Paperclip versions that do not need them (0005e: not needed for 2026.1005.0).
 OPTIONAL_MARKERS = {"// LOCAL-PATCH 0005e"}
