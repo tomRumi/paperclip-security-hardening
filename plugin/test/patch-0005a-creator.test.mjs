@@ -2,7 +2,7 @@
 // sandbox (HOME, HERMES_HOME, HERMES_SANDBOX_*, XDG_*, CODEX_HOME, ...) from the env the CREATOR supplied, because the spawn-time
 // enforcement trusts whatever is stored. Who creates matters: an AGENT (a prompt-injected CEO hiring a child) must not store them;
 // the BOARD must, because a hermes_local agent is set up with HOME = its own directory and its own HERMES_SANDBOX_HOME / _RO / _ALLOW
-// (the shape of the Studio v3 hermes agents).
+// (the shape of a company running hermes agents).
 //   create(): the two routes that create an agent for a person or an agent pass options.claudeLogin.ownerUserId = the board
 //             user's id (null for an agent actor); anything else (no option: join request, approval without a pending row,
 //             built-in agents) counts as not board and is filtered. A test below compares the routes' text.
@@ -28,13 +28,13 @@ const block = (name) => evalBlock(blockFromPatchFile(path.join(SOURCE_PATCHES_DI
 const apply = (b, type, cfg, trust, source = "create") => b.applyNewAgentSafeDefaults(type, cfg, {}, source, trust);
 const logOf = (b) => b.warnings.filter((w) => w.obj.event === "new_agent_defaults").at(-1).obj;
 
-// The Studio v3 hermes agent as the board sets it up.
-const STUDIO_HERMES = {
+// A typical hermes agent as the board sets it up.
+const LIVE_HERMES = {
   command: "/usr/local/bin/hermes-sandbox",
   env: {
-    HOME: plain("/home/ubuntu/.paperclip/instances/default/companies/c1/agents/a1"),
-    HERMES_SANDBOX_HOME: plain("/home/ubuntu/.paperclip/instances/default/companies/c1/agents/a1/hermes-home"),
-    HERMES_SANDBOX_RO: plain("/home/ubuntu/.hermes/hermes-agent,/home/ubuntu/.hermes/tools,/home/ubuntu/shared"),
+    HOME: plain("/home/user/.paperclip/instances/default/companies/c1/agents/a1"),
+    HERMES_SANDBOX_HOME: plain("/home/user/.paperclip/instances/default/companies/c1/agents/a1/hermes-home"),
+    HERMES_SANDBOX_RO: plain("/home/user/.hermes/hermes-agent,/home/user/.hermes/tools,/home/user/shared"),
     HERMES_SANDBOX_ALLOW: plain("openrouter.ai,api.example.org"),
   },
 };
@@ -42,7 +42,7 @@ const UNSAFE = {
   HERMES_SANDBOX_ALLOW: plain("evil.example"), HERMES_SANDBOX_PASS: plain("DATABASE_URL"), HERMES_SANDBOX_HOME: plain("/"), HERMES_SANDBOX_RO: plain("/"),
   HERMES_SANDBOX_BIN: plain("/bin/sh"), HERMES_HOME: plain("/home/u/.hermes"), HOME: plain("/home/u"), XDG_CONFIG_HOME: "/home/u/.config",
   OPENCODE_CONFIG: plain("/x/o.json"), CODEX_HOME: plain("/home/u/.codex"), CLAUDE_CONFIG_DIR: plain("/home/u/.claude"),
-  PAPERCLIP_API_URL: plain("https://evil.example:443"), NODE_OPTIONS: plain("--require /x.js"), LD_PRELOAD: plain("/x.so"), PATH: plain("/home/u/bin"),
+  PAPERCLIP_API_URL: plain("https://evil.example:443"), NODE_OPTIONS: plain("--require /x.js"), NODE_PATH: plain("/x"), PAPERCLIP_ADAPTER_UTILS: plain("/evil/m.js"), LD_PRELOAD: plain("/x.so"), PATH: plain("/home/u/bin"),
 };
 const CREDS = { ANTHROPIC_API_KEY: { type: "secret_ref", secretId: "s1" }, OPENROUTER_API_KEY: plain("sk-dummy"), KEEP: "1" };
 
@@ -82,10 +82,10 @@ for (const name of VARIANTS) {
     });
   }
 
-  test(`${name}: the exact Studio v3 hermes shape: a board creator's HOME and HERMES_SANDBOX_* stay, an agent's are replaced by the defaults`, () => {
-    const boardStored = apply(b, "hermes_local", structuredClone(STUDIO_HERMES), { board: true }).adapterConfig;
-    assert.deepEqual(boardStored, STUDIO_HERMES);
-    const agentStored = apply(b, "hermes_local", structuredClone(STUDIO_HERMES), undefined).adapterConfig;
+  test(`${name}: the exact live hermes shape: a board creator's HOME and HERMES_SANDBOX_* stay, an agent's are replaced by the defaults`, () => {
+    const boardStored = apply(b, "hermes_local", structuredClone(LIVE_HERMES), { board: true }).adapterConfig;
+    assert.deepEqual(boardStored, LIVE_HERMES);
+    const agentStored = apply(b, "hermes_local", structuredClone(LIVE_HERMES), undefined).adapterConfig;
     assert.deepEqual(agentStored.env, { HERMES_SANDBOX_ALLOW: plain("openrouter.ai") });
     assert.equal(agentStored.command, "/usr/local/bin/hermes-sandbox");
   });

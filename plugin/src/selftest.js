@@ -139,9 +139,11 @@ export function structuralCheck(protection, statusFiles, tree) {
  * @param {string} o.instanceRoot  the target's instance root (what resolvePaperclipInstanceRoot() returns in Paperclip)
  * @param {string} [o.userHome]     home directory of the account Paperclip runs as (the box probes check that it stays out of reach)
  * @param {object} [o.checks] functional checks (tests pass their own)
+ * @param {object} [o.upstream] {protectionId: [patch ids]} protections whose change is now part of Paperclip (their patches were not
+ *                              applied, so there is no marker block for a functional check to load): counted as satisfied, no functional check
  * @returns {Promise<{at: string, results: object}>}  results[id] = {ok, mode, checks, filesKey}
  */
-export async function runSelfTest({ engine, status, env = {}, instanceRoot, userHome = null, checks = FUNCTIONAL_CHECKS, now = () => new Date() }) {
+export async function runSelfTest({ engine, status, env = {}, instanceRoot, userHome = null, checks = FUNCTIONAL_CHECKS, upstream = {}, now = () => new Date() }) {
   if (!instanceRoot) throw new Error("runSelfTest needs the instance root of the target Paperclip");
   const tree = status.tree ?? engine.tree;
   const blockEnv = { env, instanceRoot, userHome };
@@ -151,7 +153,9 @@ export async function runSelfTest({ engine, status, env = {}, instanceRoot, user
     const p = byId[st.id];
     if (!p || p.kind !== "patch" || st.status !== "applied") continue;
     const list = [];
-    for (const c of checks[p.id] ?? []) {
+    const nowUpstream = Array.isArray(upstream?.[p.id]) && upstream[p.id].length > 0;
+    if (nowUpstream) list.push({ name: "the change is now part of Paperclip", kind: "upstream", ok: true, detail: `${upstream[p.id].join(", ")}: no longer needed, no functional check` });
+    for (const c of nowUpstream ? [] : checks[p.id] ?? []) {
       try { list.push({ name: c.name, kind: "functional", ok: true, detail: await c.run(tree, blockEnv) }); }
       catch (e) { list.push({ name: c.name, kind: "functional", ok: false, detail: e?.message ?? String(e) }); }
     }

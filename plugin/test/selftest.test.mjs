@@ -173,3 +173,32 @@ test("structural check: a file whose sha256 is not the engine's built one, or th
     assert.match(lost.detail, /marker missing for 0007/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("a protection that is now part of Paperclip counts as satisfied: no functional check, no failure for the missing marker block (fail-before: it failed)", async () => {
+  const dir = fs.mkdtempSync(`${process.env.HARDENING_TEST_SCRATCH ?? "/tmp"}/selftest-upstream-`);
+  try {
+    fs.writeFileSync(`${dir}/a.js`, "paperclip's own code, no marker\n");
+    const p = { id: "no-permission-handing", kind: "patch", patches: ["0009"], files: ["a.js"] };
+    const engine = { tree: dir, protections: () => [p] };
+    const status = { tree: dir, protections: [{ id: p.id, status: "applied" }], files: [{ rel: "a.js", currentSha: "s1", builtSha: "s1", patches: [] }] };
+    const checks = { [p.id]: [{ name: "loads the 0009 block", run: async () => { throw new Error("no LOCAL-PATCH 0009 block in the file"); } }] };
+    const without = await runSelfTest({ engine, status, instanceRoot: "/x", checks });
+    assert.equal(without.results[p.id].ok, false, "without the upstream note the functional check fails");
+    const withNote = await runSelfTest({ engine, status, instanceRoot: "/x", checks, upstream: { [p.id]: ["0009"] } });
+    assert.equal(withNote.results[p.id].ok, true);
+    assert.deepEqual(withNote.results[p.id].checks.map((c) => [c.kind, c.ok]), [["upstream", true], ["structural", true]]);
+    // the hardening passes the stored note on
+    const seen = [];
+    const fk = fakeCtx();
+    fk.state.set("instance::now-upstream", { signature: "s", protections: [{ id: p.id, title: "t", patches: ["0009"] }] });
+    const S2 = S.skip ? null : S.fresh();
+    if (S2) {
+      try {
+        const h = createHardening({ ctx: fk.ctx, ...S2.hardening, serverStartedAt: () => new Date(Date.now() + 60000).toISOString(), runSelfTestFn: async (o) => { seen.push(o.upstream); return { at: new Date().toISOString(), results: {} }; } });
+        await h.applyChange({ enabled: ["sandbox-compat"] }, ADMIN);
+        await h.selfTestAfterStart();
+        assert.deepEqual(seen, [{ [p.id]: ["0009"] }]);
+      } finally { S2.cleanup(); }
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

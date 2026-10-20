@@ -18,8 +18,9 @@
 const { spawn } = require("node:child_process");
 const os = require("node:os"), path = require("node:path"), fs = require("node:fs");
 
-const UTILS = process.env.PAPERCLIP_ADAPTER_UTILS ||   // stable path: `current` is re-pointed on every update
-  path.join(os.userInfo().homedir, ".paperclip/cli/current/node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js");
+// Fixed path from the passwd home (never from the env: the adapter merges the agent's config.env into this process's env,
+// so an env override would run an agent-chosen module outside the box). `current` is re-pointed on every update.
+const UTILS = path.join(os.userInfo().homedir, ".paperclip/cli/current/node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js");
 const list = (v, d) => (v ?? d).split(",").map((s) => s.trim()).filter(Boolean);
 const die = (m) => { console.error(`hermes-sandbox: ${m}`); process.exit(127); };
 const home = os.userInfo().homedir, BWRAP = "/usr/bin/bwrap";

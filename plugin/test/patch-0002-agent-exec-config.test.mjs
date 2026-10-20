@@ -51,8 +51,8 @@ function loadCheck(source) {
 }
 
 const plain = (value) => ({ type: "plain", value });
-const AGENT_DIR = "/home/ubuntu/.paperclip/instances/default/companies/c1/agents/a1";
-// The live shape of a Studio v3 hermes agent, and a boxed claude agent.
+const AGENT_DIR = "/home/user/.paperclip/instances/default/companies/c1/agents/a1";
+// The live shape of a typical hermes agent, and a boxed claude agent.
 const hermesAgent = () => ({
   id: "target", adapterType: "hermes_local", defaultEnvironmentId: null,
   adapterConfig: {

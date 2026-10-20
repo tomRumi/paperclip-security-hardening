@@ -151,6 +151,28 @@ for (const version of VERSIONS) {
     assert.equal(admit(old, { id: "c", adapterType: "claude_local", adapterConfig: { filesystemScope: "workspace" } }, { registered: null, scrub: null }).error, null);
   });
 
+  // ---------- code-injection env
+  test(`${version}: an agent that stores NODE_* or PAPERCLIP_ADAPTER_UTILS in its env is refused, naming the variable (fail-before: v0.1.x admitted it)`, { skip }, () => {
+    const b = admission(version, true);
+    const old = admission(version, false);
+    const plainEnv = (name) => ({ env: { KEEP: "1", [name]: { type: "plain", value: "x" } } });
+    for (const name of ["NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS", "NODE_X", "PAPERCLIP_ADAPTER_UTILS"]) {
+      for (const agent of [hermes(plainEnv(name)), ...[...CLI_TYPES, ...OTHER_SCOPED].map((t) => scoped(t, plainEnv(name)))]) {
+        const r = admit(b, agent);
+        assert.match(r.message ?? "", new RegExp(`${agent.adapterType} agent stores env ${name},`), `${agent.adapterType} ${name}`);
+        assert.match(r.message, /^Sandbox policy: run refused, /);
+        assert.equal(refusedAction(r).length, 1);
+      }
+    }
+    assert.equal(admit(old, hermes(plainEnv("NODE_OPTIONS"))).error, null, "without the rule the hermes agent is admitted");
+    assert.equal(admit(old, hermes(plainEnv("PAPERCLIP_ADAPTER_UTILS"))).error, null);
+    // ordinary env names (including lookalikes) are fine
+    for (const env of [{ KEEP: "1" }, { NODEJS_X: "1", MY_NODE_OPTIONS: "1", node_options: "1", XNODE_ENV: "1" }, undefined, null, "x", []]) {
+      assert.equal(admit(b, hermes({ env })).error, null, JSON.stringify(env));
+      assert.equal(admit(b, scoped("codex_local", { env })).error, null, JSON.stringify(env));
+    }
+  });
+
   // ---------- scoped types
   for (const type of [...CLI_TYPES, ...OTHER_SCOPED]) {
     test(`${version}: ${type} boxed with everything in place is admitted`, { skip }, () => {

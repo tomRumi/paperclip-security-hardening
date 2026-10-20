@@ -3,6 +3,6 @@
   "version": "0.2.0",
   "baseUrl": "https://github.com/tomRumi/paperclip-security-hardening/releases/download/v0.2.0/",
   "installWatchdogSha256": "42a3f6fb19dffcf946550ca3aa03cf82ffef74407c08772e449dec27e1e6bf45",
-  "installHermesSha256": "265df0edb394718871ae10dd4a680626bb2d1a64f3537761981fdfa01add0658",
-  "hermesWrapperSha256": "e9998e354cc3c1749eb104be66d118aed066b70855c90d7fe3023a198675f349"
+  "installHermesSha256": "b76066c0c5a12f47aeb96382ec5e86ae1eed8bb37baf8bfd303b823440e15b64",
+  "hermesWrapperSha256": "1a5c138d215d2a63c27c16fe929c47826fe64346c3ebdccd26531d6caa0f970f"
 }

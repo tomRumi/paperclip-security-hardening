@@ -1,5 +1,5 @@
 // host/sandbox/hermes-sandbox finds Paperclip's adapter-utils and its allowed roots under the ACCOUNT's home (the passwd entry,
-// os.userInfo().homedir), not under $HOME. The hermes_local adapter runs the wrapper with the agent's own env, and a Studio v3
+// os.userInfo().homedir), not under $HOME. The hermes_local adapter runs the wrapper with the agent's own env, and a board-configured
 // agent stores HOME = its own directory there, so os.homedir() (which reads HOME) pointed the wrapper at a directory that holds
 // no Paperclip install and no allowed root: every run failed with "cannot import ..." or "not inside an allowed root".
 //
@@ -73,4 +73,14 @@ test("an explicit HERMES_SANDBOX_RO still replaces the defaults", () => {
   const r = run(goodProject, { HERMES_SANDBOX_RO: "/opt/hermes,/opt/tools" });
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(r.stub.options.extraPaths.map((p) => p.path), ["/opt/hermes", "/opt/tools"]);
+});
+
+test("PAPERCLIP_ADAPTER_UTILS in the env is ignored: a marker module it names is never imported", () => {
+  const marker = path.join(scratch, "marker-ran");
+  const evil = path.join(scratch, "evil-utils.js");
+  fs.writeFileSync(evil, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran"); exports.buildLocalProcessSandboxSpawnTarget = async () => { throw new Error("evil module used"); };`);
+  const r = run(goodProject, { PAPERCLIP_ADAPTER_UTILS: evil });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.trim(), "wrapper-ran", "the module under the passwd home was used");
+  assert.equal(fs.existsSync(marker), false, "the env-named module never ran");
 });

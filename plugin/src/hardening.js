@@ -228,7 +228,9 @@ export function createHardening({ ctx, engineOptions = {}, resolveTargetFn = res
       await ctx.state.set(SELFTEST_KEY, { ...(prev ?? {}), at, trigger, waitingRestart: true, results: {} });
       return { ok: true, ran: false, reason: "Paperclip has not restarted since the last change; the self-test runs after the restart" };
     }
-    const r = await runSelfTestFn({ engine, status, instanceRoot: target.instanceRoot, userHome: target.userHome, env: { PAPERCLIP_HARDENING_CONFIG: target.configPath, ...(target.sandboxRootsEnv ? { PAPERCLIP_SANDBOX_WORKSPACE_ROOT: target.sandboxRootsEnv } : {}) } });
+    const upstreamState = await ctx.state.get(UPSTREAM_KEY).catch(() => null);
+    const upstream = Object.fromEntries((upstreamState?.protections ?? []).map((u) => [u.id, u.patches]));
+    const r = await runSelfTestFn({ engine, status, upstream, instanceRoot: target.instanceRoot, userHome: target.userHome, env: { PAPERCLIP_HARDENING_CONFIG: target.configPath, ...(target.sandboxRootsEnv ? { PAPERCLIP_SANDBOX_WORKSPACE_ROOT: target.sandboxRootsEnv } : {}) } });
     const failed = Object.entries(r.results).filter(([, x]) => !x.ok).map(([id]) => id).sort();
     const signature = failed.join(",");
     let alertedSignature = prev?.alertedSignature ?? "";

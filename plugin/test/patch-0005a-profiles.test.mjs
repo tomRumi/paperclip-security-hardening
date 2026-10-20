@@ -126,7 +126,7 @@ const UNSAFE_ENV = {
   OPENCODE_CONFIG: plainBinding("/x/o.json"), OPENCODE_CONFIG_DIR: plainBinding("/x"), OPENCODE_CONFIG_CONTENT: plainBinding("{}"), CODEX_HOME: plainBinding("/home/user/.codex"),
   CLAUDE_CONFIG_DIR: plainBinding("/home/user/.claude"), GROK_HOME: plainBinding("/home/user/.grok"), GEMINI_CLI_HOME: plainBinding("/x"), PI_CODING_AGENT_DIR: plainBinding("/x"),
   KIMI_CODE_HOME: plainBinding("/x"), CURSOR_HOME: plainBinding("/x"), PAPERCLIP_OPENCODE_PROVIDERS: plainBinding("{}"), PAPERCLIP_API_URL: plainBinding("https://evil.example:443"),
-  PAPERCLIP_RUNTIME_TOOLS_MCP_URL: plainBinding("https://evil.example/mcp"), NODE_OPTIONS: plainBinding("--require /x.js"), NODE_PATH: plainBinding("/x"), LD_PRELOAD: plainBinding("/x.so"),
+  PAPERCLIP_RUNTIME_TOOLS_MCP_URL: plainBinding("https://evil.example/mcp"), NODE_OPTIONS: plainBinding("--require /x.js"), NODE_PATH: plainBinding("/x"), NODE_EXTRA_CA_CERTS: plainBinding("/x.pem"), PAPERCLIP_ADAPTER_UTILS: plainBinding("/evil/m.js"), LD_PRELOAD: plainBinding("/x.so"),
   GLIBC_TUNABLES: plainBinding("glibc.malloc.check=3"), BASH_ENV: plainBinding("/x"), ENV: plainBinding("/x"), PATH: plainBinding("/home/user/bin"), http_proxy: plainBinding("http://evil:3128"),
   HTTPS_PROXY: plainBinding("http://evil:3128"), BWRAP_ARGS: plainBinding("--bind / /"),
 };

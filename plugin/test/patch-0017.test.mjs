@@ -249,9 +249,15 @@ test("boxedSandboxOptions: inside the home only the instance's workspaces/projec
     for (const bad of [path.join(fakeHome, ".ssh"), path.join(fakeHome, ".ssh", "id_ed25519"), path.join(instance, "secrets"), path.join(instance, "db"), instance, path.join(fakeHome, ".paperclip"), path.join(fakeHome, "notes")]) {
       assert.throws(() => ok({ workspaceDir: bad }), /home directory/, `workspaceDir ${bad}`);
       assert.throws(() => ok({ managedRw: [bad] }), /home directory/, `managedRw ${bad}`);
-      assert.throws(() => ok({ managedRo: [bad] }), /home directory/, `managedRo ${bad}`);
-      assert.throws(() => ok(withExtra(bad)), /home directory/, `extra path ${bad}`);
-      assert.throws(() => ok(withExtra({ path: bad, access: "ro" })), /home directory/, `extra ro path ${bad}`);
+      // read-only mounts are looser in the home (see the next test): ~/notes is fine, the rest stays refused
+      if (bad !== path.join(fakeHome, "notes")) {
+        assert.throws(() => ok(withExtra(bad)), /home directory|instance/, `extra path ${bad}`);
+        assert.throws(() => ok({ managedRo: [bad] }), /home directory|instance/, `managedRo ${bad}`);
+        assert.throws(() => ok(withExtra({ path: bad, access: "ro" })), /home directory|instance/, `extra ro path ${bad}`);
+      } else {
+        assert.ok(ok({ managedRo: [bad] }) && ok(withExtra(bad)) && ok(withExtra({ path: bad, access: "ro" })), "a read-only mount of ~/notes is allowed");
+        assert.throws(() => ok(withExtra({ path: bad, access: "rw" })), /home directory/, "a read-write one is not");
+      }
     }
     // outside the home is not this guard's business (a tmp dir, /opt/tools)
     assert.ok(ok({ managedRo: [path.join(scratch, "elsewhere")], ...withExtra("/opt/tools") }));
@@ -273,6 +279,69 @@ test("boxedSandboxOptions: inside the home only the instance's workspaces/projec
         assert.throws(() => ok({ workspaceDir: path.join(fakeHome, "notes") }), /home directory/, `root ${wide}`);
       }
     } finally { delete globalThis[WORKSPACE_ROOTS_KEY]; }
+  });
+});
+
+// Read-only extra paths (set by the board; an agent cannot change them, patch 0002) are allowed anywhere except a denylist; read-write
+// mounts keep the strict rule. The paths below are the classes of the live agents' stored extra paths.
+test("boxedSandboxOptions: read-only extra paths are allowed in the home except credential and state locations, the instance's other parts and the home itself; read-write stays strict", { skip: needVersion }, async (t) => {
+  const { mod, skip } = await sandbox(V);
+  if (skip) return t.skip(skip);
+  const fakeHome = path.join(scratch, "fh-ro");
+  const instance = path.join(fakeHome, ".paperclip", "instances", "default");
+  const h = (...p) => path.join(fakeHome, ...p);
+  const allowedRo = [
+    h("setup", "agent-mcp.json"), h("setup", "bin", "pipeline.py"), h("setup", "bin", "ci-report.py"), h("browser"), h(".cache", "ms-playwright"),
+    h(".paperclip", "cli", "installs", "npm", "2026.1012.0", "node_modules", "@paperclipai", "server", "skills"),
+    path.join(instance, "skills", "c1", "__catalog__"), path.join(instance, "skills"), path.join(instance, "workspaces", "w"), path.join(instance, "companies", "c1", "agents", "a1", "skills"),
+    h(".local", "bin"), h(".config", "some-tool"), h(".claude-other"),
+  ];
+  const deniedRo = [
+    path.join(instance, "db"), path.join(instance, "db", "x"), path.join(instance, "secrets"), path.join(instance, "secrets", "master.key"), path.join(instance, "config.json"),
+    path.join(instance, "companies", "c2"), path.join(instance, "companies", "c2", "agents", "a9"), path.join(instance, "companies", "c1", "agents", "a2"), path.join(instance, "companies"),
+    instance, h(".paperclip"), fakeHome, path.dirname(fakeHome), "/",
+    h(".ssh"), h(".ssh", "id_ed25519"), h(".gnupg"), h(".gnupg", "private-keys-v1.d"), h(".config", "paperclip-board"), h(".config", "paperclip-board", "token"), h(".config", "paperclip-x"),
+    h(".local", "state"), h(".local", "state", "paperclip", "x"), h(".aws"), h(".aws", "credentials"), h(".config", "gcloud"), h(".docker"), h(".docker", "config.json"),
+    h(".npmrc"), h(".netrc"), h(".claude"), h(".claude", ".credentials.json"), h(".claude.json"),
+    h(".config"), h(".local"), // they hold denied entries
+  ];
+  for (const d of [h("setup", "bin"), h("browser"), h(".cache", "ms-playwright"), h(".ssh"), h(".config", "paperclip-board"), h(".config", "gcloud"), h(".local", "state"), h(".local", "bin"), h(".claude"), h(".aws"), h(".docker"), h(".gnupg"), h(".config", "some-tool"), h(".claude-other"),
+    path.join(instance, "db"), path.join(instance, "secrets"), path.join(instance, "skills", "c1", "__catalog__"), path.join(instance, "workspaces", "w"), path.join(instance, "companies", "c1", "agents", "a1", "skills"),
+    path.join(instance, "companies", "c1", "agents", "a2"), path.join(instance, "companies", "c2", "agents", "a9"), h(".paperclip", "cli", "installs", "npm", "2026.1012.0", "node_modules", "@paperclipai", "server", "skills")]) fs.mkdirSync(d, { recursive: true });
+  for (const f of ["setup/agent-mcp.json", "setup/bin/pipeline.py", "setup/bin/ci-report.py", ".npmrc", ".netrc", ".claude.json", ".ssh/id_ed25519", ".aws/credentials", ".config/paperclip-board/token"]) fs.writeFileSync(h(f), "x");
+  fs.writeFileSync(path.join(instance, "config.json"), "{}"); fs.mkdirSync(path.join(instance, "secrets"), { recursive: true }); fs.writeFileSync(path.join(instance, "secrets", "master.key"), "x");
+  fs.mkdirSync(path.join(instance, "db", "x"), { recursive: true }); fs.mkdirSync(path.join(instance, "companies", "c1", "agents", "a1"), { recursive: true });
+  fs.mkdirSync(h(".ssh"), { recursive: true }); fs.mkdirSync(h(".claude"), { recursive: true }); fs.mkdirSync(h(".gnupg", "private-keys-v1.d"), { recursive: true }); fs.mkdirSync(h(".config", "paperclip-x"), { recursive: true });
+  fs.mkdirSync(h(".local", "state", "paperclip", "x"), { recursive: true }); fs.mkdirSync(h(".docker"), { recursive: true }); fs.writeFileSync(h(".docker", "config.json"), "{}"); fs.mkdirSync(h(".claude"), { recursive: true });
+  fs.writeFileSync(h(".claude", ".credentials.json"), "x");
+  // a link in a harmless place that leads to a denied one is judged by where it leads
+  fs.rmSync(h("setup", "link-to-ssh"), { force: true }); fs.symlinkSync(h(".ssh"), h("setup", "link-to-ssh"));
+  const runtimeDir = path.join(instance, "companies", "c1", "agents", "a1", "claude-runtime");
+  const ok = (over) => mod.boxedSandboxOptions(baseInput({ ...IDS, runtimeDir, workspaceDir: path.join(instance, "workspaces", "a1"), ...over }));
+  const extra = (p, access) => ({ config: { ...baseInput().config, filesystemExtraPaths: [typeof access === "string" ? { path: p, access } : p] } });
+  await withEnv({ HOME: fakeHome, PAPERCLIP_HOME: undefined, PAPERCLIP_INSTANCE_ID: undefined, PAPERCLIP_SANDBOX_WORKSPACE_ROOT: undefined }, () => {
+    for (const p of allowedRo) {
+      assert.ok(ok(extra(p, "ro")), `read-only ${p} allowed`);
+      assert.ok(ok(extra(p)), `a plain extra path is read-only: ${p}`);
+    }
+    for (const p of [...deniedRo, h("setup", "link-to-ssh")]) {
+      assert.throws(() => ok(extra(p, "ro")), /home directory|instance/, `read-only ${p} refused`);
+      assert.throws(() => ok(extra(p)), /home directory|instance/, `plain extra ${p} refused`);
+    }
+    // read-write keeps the strict rule: nothing of the allowed set in the home outside the instance's own boxes
+    for (const p of [h("setup", "agent-mcp.json"), h("browser"), h(".cache", "ms-playwright"), path.join(instance, "skills", "c1", "__catalog__"), h(".local", "bin")])
+      assert.throws(() => ok(extra(p, "rw")), /home directory|instance/, `read-write ${p} refused`);
+    assert.ok(ok(extra(path.join(instance, "workspaces", "w"), "rw")), "read-write in a workspaces directory is fine");
+  });
+  // the same denial in a layout where the instance is outside the home
+  const out = path.join(scratch, "ph-ro", "data");
+  const outInstance = path.join(out, "instances", "default");
+  fs.mkdirSync(path.join(outInstance, "db"), { recursive: true }); fs.mkdirSync(path.join(outInstance, "skills", "c1"), { recursive: true });
+  await withEnv({ HOME: fakeHome, PAPERCLIP_HOME: out, PAPERCLIP_INSTANCE_ID: undefined, PAPERCLIP_SANDBOX_WORKSPACE_ROOT: undefined }, () => {
+    const okOut = (over) => mod.boxedSandboxOptions(baseInput({ ...IDS, runtimeDir: path.join(outInstance, "companies", "c1", "agents", "a1", "claude-runtime"), workspaceDir: path.join(outInstance, "workspaces", "a1"), ...over }));
+    assert.ok(okOut(extra(h("setup", "agent-mcp.json"), "ro")));
+    assert.ok(okOut(extra(path.join(outInstance, "skills", "c1"), "ro")));
+    for (const p of [path.join(outInstance, "db"), outInstance, out, h(".ssh")]) assert.throws(() => okOut(extra(p, "ro")), /home directory|instance/, p);
   });
 });
 

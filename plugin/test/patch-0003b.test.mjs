@@ -99,6 +99,19 @@ for (const version of VERSIONS) {
     assert.equal(same.env.HERMES_SANDBOX_ALLOW, "openrouter.ai,evil.example");
   });
 
+  test(`${version}: a Hermes run cannot set PAPERCLIP_ADAPTER_UTILS or any NODE_* name (the wrapper would load or preload code)`, { skip }, async () => {
+    const b = blockOf(build(version, { with0003b: true }).content);
+    const out = await enforce(b, hermes({ env: { KEEP: "1" } }), { command: WRAPPER, env: { PAPERCLIP_ADAPTER_UTILS: "/evil/m.js", NODE_OPTIONS: "--require /x.js", NODE_PATH: "/x", NODE_EXTRA_CA_CERTS: "/x.pem", KEEP: "1" } });
+    assert.deepEqual(out.env, { KEEP: "1" });
+    // a stored plain value is restored instead (the board's own choice), like the other flagged names
+    const bs = blockOf(build(version, { with0003b: true }).content);
+    const kept = await enforce(bs, hermes({ env: { NODE_OPTIONS: plain("--max-old-space-size=64") } }), { command: WRAPPER, env: { NODE_OPTIONS: "--require /x.js" } });
+    assert.equal(kept.env.NODE_OPTIONS, "--max-old-space-size=64");
+    // the chain without 0003b let PAPERCLIP_ADAPTER_UTILS through
+    const old = blockOf(build(version, { with0003b: false }).content);
+    assert.equal((await enforce(old, hermes(), { command: WRAPPER, env: { PAPERCLIP_ADAPTER_UTILS: "/evil/m.js" } })).env.PAPERCLIP_ADAPTER_UTILS, "/evil/m.js");
+  });
+
   test(`${version}: Hermes values equal to the stored ones pass untouched; an agent that is not on the wrapper is left alone`, { skip }, async () => {
     const b = blockOf(build(version, { with0003b: true }).content);
     const stored = hermes({ env: { HERMES_SANDBOX_ALLOW: plain("openrouter.ai") } });
@@ -266,7 +279,7 @@ for (const version of VERSIONS) {
     const credentialNames = [...new Set(Object.values(BOX_PROFILES).flatMap((p) => p.credentialEnvNames))];
     assert.ok(stateNames.includes("CURSOR_DATA_DIR") && stateNames.length > 15, "the profile table feeds the list");
     const names = [...new Set([...stateNames, ...credentialNames, ...Object.keys(REDIRECTS), "HERMES_SANDBOX_ALLOW", "HERMES_SANDBOX_PASS", "HERMES_SANDBOX_HOME", "HERMES_SANDBOX_RO", "HERMES_SANDBOX_BIN", "sandbox_x", "BWRAP_ARGS", "bwrap_x",
-      "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "GLIBC_TUNABLES", "NODE_OPTIONS", "NODE_PATH", "NODE_ENV", "BASH_ENV", "ENV", "http_proxy", "HTTPS_PROXY", "all_proxy", "NO_PROXY", "no_proxy", "PROXY_URL",
+      "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "GLIBC_TUNABLES", "NODE_OPTIONS", "NODE_PATH", "NODE_ENV", "NODE_EXTRA_CA_CERTS", "NODE_X", "PAPERCLIP_ADAPTER_UTILS", "BASH_ENV", "ENV", "http_proxy", "HTTPS_PROXY", "all_proxy", "NO_PROXY", "no_proxy", "PROXY_URL",
       "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME", "OPENCODE_AUTH_JSON", "OPENCODE_MODEL", "XDG_RUNTIME_DIR", "XDG_X", "PAPERCLIP_API_URL", "PAPERCLIP_API_KEY", "PAPERCLIP_RUNTIME_TOOLS_MCP_URL",
       "PAPERCLIP_RUNTIME_TOOLS_TOKEN", "PAPERCLIP_RUN_ID", "PAPERCLIP_FOO_PROVIDERS", "PAPERCLIP_PROVIDERS", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "KEEP", "HOMEBREW_X", "MYHOME"])];
     for (const [pathValue, flagged] of [["/usr/bin:/bin", false], ["/evil/bin", true], ["/usr/bin:/home/x", true], ["relative", true]]) {

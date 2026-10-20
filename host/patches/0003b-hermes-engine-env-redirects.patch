@@ -29,7 +29,7 @@
 +const SANDBOX_MANAGED_AI_HOME_ENV_0003B = new Set(["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "CODEX_HOME", "GROK_HOME", "CLAUDE_CONFIG_DIR"]);
 +const SANDBOX_STATE_REDIRECT_ENV_0003B = new Set(["HOME", "HERMES_HOME", "GEMINI_CLI_HOME", "PI_CODING_AGENT_DIR", "KIMI_CODE_HOME", "CURSOR_HOME", "CURSOR_DATA_DIR"]);
 +function sandboxIsStateRedirectEnv0003B(key) {
-+    return SANDBOX_STATE_REDIRECT_ENV_0003B.has(key) || /^XDG_/.test(key) || (/^OPENCODE_/.test(key) && key !== "OPENCODE_AUTH_JSON") ||
++    return SANDBOX_STATE_REDIRECT_ENV_0003B.has(key) || /^XDG_/.test(key) || (/^OPENCODE_/.test(key) && key !== "OPENCODE_AUTH_JSON") || /^NODE_/.test(key) || key === "PAPERCLIP_ADAPTER_UTILS" ||
 +        /^PAPERCLIP_[A-Z0-9_]+_PROVIDERS$/.test(key);
 +}
 +// The Paperclip API URL and the runtime-tools endpoints are computed by the adapter for each run; a config.env entry of the same

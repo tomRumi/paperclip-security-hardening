@@ -1,6 +1,6 @@
 --- a/node_modules/@paperclipai/server/dist/services/heartbeat.js
 +++ b/node_modules/@paperclipai/server/dist/services/heartbeat.js
-@@ -1027,28 +1027,72 @@
+@@ -1027,28 +1027,82 @@
      };
  }
  const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
@@ -29,6 +29,12 @@
 +    grok_local: { engineCli: false },
 +};
 +const SANDBOX_EXCEPTIONABLE_TYPES_0005F = ["cursor_cloud", "openclaw_gateway", "hermes_gateway", "http", "process"];
++// An env name that runs code inside a node process before any wrapper or box code can look at it (NODE_OPTIONS=--require, NODE_PATH,
++// ...) or that makes the Hermes wrapper load a module of the caller's choice. The box and the wrapper cannot defend against these,
++// so an agent that stores one is refused (patches 0005a and 0003b also keep them out of new agents and runs).
++function sandboxIsCodeInjectionEnv0005f(key) {
++    return /^NODE_/.test(key) || key === "PAPERCLIP_ADAPTER_UTILS";
++}
 +function sandboxHasRemoteException0005f(agentId, adapterType) {
 +    const list = readHardeningConfig0003().remoteExceptions;
 +    return Array.isArray(list) && list.some((entry) => entry !== null && typeof entry === "object" && !Array.isArray(entry) && entry.agentId === agentId && entry.type === adapterType);
@@ -75,6 +81,10 @@
 -        refusal = `adapter type "${adapterType}" has no sandbox implementation`;
 +        missing.push(`adapter type "${adapterType}" has no sandbox implementation and cannot be excepted`);
      }
++    if (typeof adapterType === "string" && (Object.hasOwn(SANDBOX_ADMISSION_0005F, adapterType) || adapterType === "hermes_local")) {
++        for (const key of Object.keys(parseObject(stored.env)).filter(sandboxIsCodeInjectionEnv0005f))
++            missing.push(`${adapterType} agent stores env ${key}, which runs code in the agent's launcher before the box starts (remove it from the agent's env)`);
++    }
 -    if (!refusal)
 +    if (missing.length === 0)
          return;

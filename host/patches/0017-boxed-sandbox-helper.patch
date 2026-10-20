@@ -105,7 +105,7 @@
                  await fs.rm(tempDir, { recursive: true, force: true });
                  throw error;
              });
-@@ -610,4 +662,221 @@
+@@ -610,4 +662,244 @@
          return { path: normalizeAbsolutePath(raw.path, `filesystemExtraPaths[${index}].path`), access };
      });
  }
@@ -175,7 +175,8 @@
 +// directory of the user running Paperclip: below the instance's workspaces or projects directory, below THIS agent's own
 +// companies/<companyId>/agents/<agentId> directory, or below a workspace root (the roots patch 0003b publishes, else
 +// $PAPERCLIP_SANDBOX_WORKSPACE_ROOT). Anything else in the instance (db, secrets, logs, config, other companies and agents) or in the
-+// home (~/.ssh, ~/.aws) is never mounted, and neither is a parent of the home or of the instance. The instance is guarded on its
++// home (~/.ssh, ~/.aws) is never mounted, and neither is a parent of the home or of the instance. A READ-ONLY mount is looser inside
++// the home: anything except the credential and state locations of readOnlyHomeDenied (the instance rule stays, plus its skills directory). The instance is guarded on its
 +// own, so PAPERCLIP_HOME outside the home protects the same. Every path is resolved through symlinks first (the nearest existing
 +// ancestor when it is not created yet), so a link cannot lead there.
 +function realPathLoose(candidate) {
@@ -238,7 +239,20 @@
 +    // other companies' caches and every other directory under companies/ stay out
 +    const ownPromptCache = access === "ro" && BOXED_ID_PATTERN.test(String(ids?.companyId ?? ""))
 +        ? [path.join(instanceRoot, "companies", ids.companyId, "claude-prompt-cache")] : [];
-+    return [...ownAgentDir, ...instanceDirs, ...workspaceRoots, ...ownPromptCache];
++    // read-only only: the instance's skills directory (server-managed skill catalogs the board attaches to agents)
++    const skillsDir = access === "ro" ? [path.join(instanceRoot, "skills")] : [];
++    return [...ownAgentDir, ...instanceDirs, ...workspaceRoots, ...ownPromptCache, ...skillsDir];
++}
++// What a read-only mount may not show, relative to the home of the user running Paperclip: the SSH, GPG, cloud and registry credentials,
++// the board's tokens (.config/paperclip-*), Paperclip's own state (.local/state), the user's Claude credentials, and any directory
++// that holds one of those (.config and .local themselves). The home directory and its parents are refused before this.
++function readOnlyHomeDenied(relative) {
++    const [first, second] = relative.split(path.sep);
++    if ([".ssh", ".gnupg", ".aws", ".docker", ".npmrc", ".netrc", ".claude", ".claude.json"].includes(first))
++        return true;
++    if (first === ".config")
++        return second === undefined || second === "gcloud" || second.startsWith("paperclip-");
++    return first === ".local" && (second === undefined || second === "state");
 +}
 +function assertBoxedPathAllowed(label, candidate, ids, access = "rw") {
 +    const real = realPathLoose(candidate);
@@ -248,6 +262,15 @@
 +        throw new Error(`${label}: refusing to mount "${candidate}", it contains the home directory of the user running Paperclip.`);
 +    const inHome = homes.some((home) => isInsidePath(home, real));
 +    const inInstance = isInsidePath(instanceRoot, real) || isInsidePath(real, instanceRoot); // inside the instance, or a parent of it
++    if (access === "ro") {
++        // Read-only mounts (the board sets the extra paths; an agent cannot change them, patch 0002) are allowed anywhere except the
++        // instance (only the places listed in boxedAllowedRoots) and the home's credential and state locations (readOnlyHomeDenied).
++        const denied = homes.some((home) => isInsidePath(home, real) && readOnlyHomeDenied(path.relative(home, real)));
++        if (!denied && (!inInstance || boxedAllowedRoots(homes, instanceRoot, ids, access).some((root) => isInsidePath(root, real))))
++            return;
++        throw new Error(`${label}: refusing to mount "${candidate}"${real === candidate ? "" : ` (resolves to "${real}")`} read-only, it is ${denied ? "a credential or state location in the home directory of the user running Paperclip (or contains one)" : `inside, or a parent of, the Paperclip instance directory "${instanceRoot}"`} `
++            + "and not one of the instance's workspaces, projects or skills directories, this agent's own companies/<company>/agents/<agent> directory, a workspace root or its company's claude-prompt-cache.");
++    }
 +    if (!inHome && !inInstance)
 +        return;
 +    if (boxedAllowedRoots(homes, instanceRoot, ids, access).some((root) => isInsidePath(root, real)))

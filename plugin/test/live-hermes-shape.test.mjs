@@ -1,4 +1,4 @@
-// The exact shape of the Studio v3 hermes agents, end to end through the patches that decide about them:
+// The exact shape of a company running hermes agents, end to end through the patches that decide about them:
 //   hermes_local, adapterConfig.command = /usr/local/bin/hermes-sandbox, NO hermesCommand,
 //   env { HOME: <the agent's directory>, HERMES_SANDBOX_HOME, HERMES_SANDBOX_RO, HERMES_SANDBOX_ALLOW }
 //   0005a  a board user creating it stores it as given (an agent creating it would lose HOME and HERMES_SANDBOX_*)
@@ -31,13 +31,13 @@ let n = 0;
 const freshRoot = () => { const d = path.join(scratch, `root-${++n}`); fs.mkdirSync(d, { mode: 0o700, recursive: true }); return d; };
 
 const plain = (value) => ({ type: "plain", value });
-const AGENT_DIR = "/home/ubuntu/.paperclip/instances/default/companies/c1/agents/a1";
+const AGENT_DIR = "/home/user/.paperclip/instances/default/companies/c1/agents/a1";
 const LIVE_SHAPE = () => ({
   command: WRAPPER,
   env: {
     HOME: plain(AGENT_DIR),
     HERMES_SANDBOX_HOME: plain(`${AGENT_DIR}/hermes-home`),
-    HERMES_SANDBOX_RO: plain("/home/ubuntu/.hermes/hermes-agent,/home/ubuntu/.hermes/tools,/home/ubuntu/studio"),
+    HERMES_SANDBOX_RO: plain("/home/user/.hermes/hermes-agent,/home/user/.hermes/tools,/home/user/tools-extra"),
     HERMES_SANDBOX_ALLOW: plain("openrouter.ai,api.example.org"),
   },
 });

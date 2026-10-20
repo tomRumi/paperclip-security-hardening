@@ -177,7 +177,7 @@
 +function newAgentEnvIsUnsafe(key, binding) {
 +    if (/SANDBOX/i.test(key) || /^BWRAP/i.test(key) || /^(LD_|DYLD_)/.test(key) || key === "GLIBC_TUNABLES")
 +        return true;
-+    if (key === "NODE_OPTIONS" || key === "NODE_PATH" || key === "BASH_ENV" || key === "ENV" || /^(https?|all|no)_proxy$/i.test(key))
++    if (/^NODE_/.test(key) || key === "PAPERCLIP_ADAPTER_UTILS" || key === "BASH_ENV" || key === "ENV" || /^(https?|all|no)_proxy$/i.test(key))
 +        return true;
 +    if (key === "PATH") {
 +        const value = typeof binding === "string" ? binding : isPlainRecord(binding) && binding.type === "plain" ? binding.value : null;
