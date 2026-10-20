@@ -11,13 +11,13 @@
  import { recordAgentStatusEvent, recordResourceCreationEvent } from "./resource-lifecycle-events.js";
  import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
  import { assertClaudeOAuthBindingInvariant, claudeOAuthBindingsMatchExactly, claudeOAuthClaimRejectedError, CLAUDE_LOCAL_ADAPTER_TYPE, readClaudeOAuthBinding, secretService, } from "./secrets.js";
-@@ -41,6 +45,216 @@
+@@ -41,6 +45,245 @@
  function jsonEqual(left, right) {
      return JSON.stringify(left) === JSON.stringify(right);
  }
 +// LOCAL-PATCH 0005a: safe defaults for every NEW agent row (direct create, hire/approval materialisation, join request,
 +// built-in agents all pass through create(); a pending hire is activated through activatePendingApproval()). The
-+// defaults OVERRIDE whatever the creator supplied for these keys (and creator-supplied env names that redirect the box are removed); later board PATCHes (updateAgent) are not touched,
++// defaults OVERRIDE whatever the creator supplied for these keys (and, when the creator is not a board user, creator-supplied env names that redirect the box are removed); later board PATCHes (updateAgent) are not touched,
 +// so extra hosts / paths are added afterwards by the board. Edited here (server-side code), never agent-writable.
 +// Site values come from the hardening settings file, read once at startup (written by the Security hardening plugin, never
 +// agent-writable; ignored unless it passes the location and ownership checks below): $PAPERCLIP_HARDENING_CONFIG, else
@@ -160,12 +160,18 @@
 +    // hermes-sandbox replaces its default read-only set (Hermes install) when this is set; null keeps the wrapper's own.
 +    hermesSandboxRo: safeSettingList(SAFE_SETTINGS.hermesReadOnlyPaths, true)?.join(",") ?? null,
 +};
-+// Environment names a creator may not store on a boxed agent. The spawn-time enforcement (patch 0003) lets a run value through
++// Environment names an AGENT may not store on a new agent. The spawn-time enforcement (patch 0003) lets a run value through
 +// when it equals the STORED plain value, so whatever is stored at creation stays trusted for every later run: a creator-supplied
 +// CODEX_HOME=~/.codex, HERMES_SANDBOX_PASS=DATABASE_URL or HERMES_SANDBOX_HOME would be honoured forever. Every name the enforcement
 +// (sandboxEnvDropReason and the 0003b redirect rule in heartbeat.js; a test compares the two over a list of names) would drop from a
-+// run is removed here, credentials (API keys, tokens, secret references under any other name) are kept. The board can still set such
-+// a value later with a PATCH; that is a deliberate act of the board.
++// run is removed here, credentials (API keys, tokens, secret references under any other name) are kept. A board user may store such
++// a value (a hermes_local agent needs HOME, HERMES_SANDBOX_HOME and its allowlist from the board that sets it up; the board can set
++// them with a PATCH anyway), so the removal applies to every other creator. Who the creator is: create() is told by the two
++// routes that create an agent for a person or an agent (POST /agents, POST /agent-hires) through options.claudeLogin.ownerUserId,
++// which is the user id of a board actor and null for an agent actor (a test compares both routes' text); a create() without that
++// option (join request, approval without a pending row, built-in agents) is treated as not board. A pending hire that is
++// activated keeps only the unsafe names its pending row already stores (they went through create() with the creator known), so an
++// approval payload cannot add one.
 +const NEW_AGENT_SYSTEM_PATH_DIRS = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/snap"];
 +const NEW_AGENT_STATE_ENV = new Set(["HOME", "HERMES_HOME", "GEMINI_CLI_HOME", "PI_CODING_AGENT_DIR", "KIMI_CODE_HOME", "CURSOR_HOME", "CURSOR_DATA_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GROK_HOME"]);
 +function newAgentEnvIsUnsafe(key, binding) {
@@ -180,22 +186,45 @@
 +    return NEW_AGENT_STATE_ENV.has(key) || /^XDG_/.test(key) || (/^OPENCODE_/.test(key) && key !== "OPENCODE_AUTH_JSON") ||
 +        /^PAPERCLIP_[A-Z0-9_]+_PROVIDERS$/.test(key) || key === "PAPERCLIP_API_URL" || /^PAPERCLIP_RUNTIME_TOOLS_/.test(key);
 +}
-+function withoutUnsafeEnv(config, dropped) {
++function creatorIsBoard0005a(options) {
++    const owner = options?.claudeLogin?.ownerUserId;
++    return typeof owner === "string" && owner !== "";
++}
++function stableJson0005a(value) {
++    if (Array.isArray(value))
++        return `[${value.map(stableJson0005a).join(",")}]`;
++    if (isPlainRecord(value))
++        return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson0005a(value[key])}`).join(",")}}`;
++    return JSON.stringify(value) ?? "null";
++}
++// trust: { board: true } (the creator is a board user: nothing is removed) or { storedEnv } (activation: only a binding that is
++// already stored) or undefined (an agent or unknown creator: every unsafe name is removed).
++function newAgentEnvIsTrusted(key, binding, trust) {
++    if (trust?.board === true)
++        return true;
++    return isPlainRecord(trust?.storedEnv) && Object.hasOwn(trust.storedEnv, key) && stableJson0005a(trust.storedEnv[key]) === stableJson0005a(binding);
++}
++function withoutUnsafeEnv(config, dropped, trust, kept = []) {
 +    if (!isPlainRecord(config.env))
 +        return config;
 +    const env = {};
 +    for (const [key, binding] of Object.entries(config.env)) {
-+        if (newAgentEnvIsUnsafe(key, binding))
-+            dropped.push(key);
-+        else
++        if (!newAgentEnvIsUnsafe(key, binding))
 +            env[key] = binding;
++        else if (newAgentEnvIsTrusted(key, binding, trust)) {
++            env[key] = binding;
++            kept.push(key);
++        }
++        else
++            dropped.push(key);
 +    }
 +    return { ...config, env };
 +}
-+function applyNewAgentSafeDefaults(adapterType, adapterConfig, permissions, source) {
++function applyNewAgentSafeDefaults(adapterType, adapterConfig, permissions, source, trust) {
 +    const nextPermissions = { ...(isPlainRecord(permissions) ? permissions : {}), canCreateAgents: NEW_AGENT_SAFE_DEFAULTS.canCreateAgents, canCreateSkills: false };
 +    let nextConfig = isPlainRecord(adapterConfig) ? { ...adapterConfig } : {};
 +    const droppedEnv = [];
++    const keptEnv = [];
 +    if (Object.hasOwn(NEW_AGENT_BOX_PROFILES, adapterType)) {
 +        // engine (types with engineCli): the adapter's default (unset, "auto" or any unknown value) is ACP, which it refuses to run
 +        // under a filesystem or network scope ("requires the ... CLI engine"), so a new boxed agent would fail at its first run, and an
@@ -210,34 +239,34 @@
 +            networkScope: NEW_AGENT_SAFE_DEFAULTS.networkScope,
 +            networkAllowlist: boxAllowlist(adapterType),
 +        };
-+        nextConfig = withoutUnsafeEnv(nextConfig, droppedEnv);
++        nextConfig = withoutUnsafeEnv(nextConfig, droppedEnv, trust, keptEnv);
 +    }
 +    else if (adapterType === "hermes_local") {
 +        // env values are stored as { type: "plain", value } bindings (a bare string is also accepted by the resolver).
-+        const env = isPlainRecord(nextConfig.env) ? withoutUnsafeEnv(nextConfig, droppedEnv).env : {};
-+        env.HERMES_SANDBOX_ALLOW = { type: "plain", value: NEW_AGENT_SAFE_DEFAULTS.hermesSandboxAllow };
-+        if (NEW_AGENT_SAFE_DEFAULTS.hermesSandboxRo === null)
-+            delete env.HERMES_SANDBOX_RO;
-+        else
++        // A HERMES_SANDBOX_ALLOW / HERMES_SANDBOX_RO the creator was allowed to keep (a board user's) stays; otherwise the defaults fill in.
++        const env = isPlainRecord(nextConfig.env) ? withoutUnsafeEnv(nextConfig, droppedEnv, trust, keptEnv).env : {};
++        if (env.HERMES_SANDBOX_ALLOW === undefined)
++            env.HERMES_SANDBOX_ALLOW = { type: "plain", value: NEW_AGENT_SAFE_DEFAULTS.hermesSandboxAllow };
++        if (env.HERMES_SANDBOX_RO === undefined && NEW_AGENT_SAFE_DEFAULTS.hermesSandboxRo !== null)
 +            env.HERMES_SANDBOX_RO = { type: "plain", value: NEW_AGENT_SAFE_DEFAULTS.hermesSandboxRo };
 +        nextConfig = { ...nextConfig, command: NEW_AGENT_SAFE_DEFAULTS.hermesCommand, env };
 +    }
-+    logger.warn({ event: "new_agent_defaults", adapterType, source, ...(droppedEnv.length ? { droppedEnv } : {}) }, "new agent: sandbox and permission defaults applied (creator-supplied values for these keys are ignored)");
++    logger.warn({ event: "new_agent_defaults", adapterType, source, ...(droppedEnv.length ? { droppedEnv } : {}), ...(keptEnv.length ? { keptEnv } : {}) }, "new agent: sandbox and permission defaults applied (creator-supplied values for these keys are ignored)");
 +    return { adapterConfig: nextConfig, permissions: nextPermissions };
 +}
  function buildConfigSnapshot(row) {
      const adapterConfig = typeof row.adapterConfig === "object" && row.adapterConfig !== null && !Array.isArray(row.adapterConfig)
          ? sanitizeRecord(row.adapterConfig)
-@@ -690,6 +904,8 @@
+@@ -690,6 +933,8 @@
                  nextConfig: adapterConfig,
                  priorConfig: null,
              });
 +            // LOCAL-PATCH 0005a
-+            const safeDefaults = applyNewAgentSafeDefaults(adapterType, adapterConfig, normalizedPermissions, "create");
++            const safeDefaults = applyNewAgentSafeDefaults(adapterType, adapterConfig, normalizedPermissions, "create", { board: creatorIsBoard0005a(options) });
              return db.transaction(async (tx) => {
                  const txDb = tx;
                  // Consume the stored-session claim and create the fixed definition inside
-@@ -712,8 +928,8 @@
+@@ -712,8 +957,8 @@
                      companyId,
                      role,
                      adapterType,
@@ -248,7 +277,7 @@
                      runtimeConfig,
                  })
                      .returning()
-@@ -721,7 +937,7 @@
+@@ -721,7 +966,7 @@
                  // New standard agents receive the standard direct grants at activation.
                  // Low-trust and bundled agents keep their explicit, narrower grants.
                  if (created.status !== "pending_approval" && !permissionsImplyLowTrust(normalizedPermissions) &&
@@ -257,13 +286,13 @@
                      await tx.insert(principalPermissionGrants).values(NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS.map((permissionKey) => ({
                          companyId,
                          principalType: "agent",
-@@ -901,6 +1117,13 @@
+@@ -901,6 +1146,13 @@
                      // request, so the new-agent creation default applies.
                      patch.permissions = normalizeAgentPermissions(patch.permissions, { context: "create" });
                  }
 +                // LOCAL-PATCH 0005a: the approval payload carries the redacted display copy and the requester's values.
 +                if (patch.adapterConfig !== undefined || patch.permissions !== undefined) {
-+                    const safe = applyNewAgentSafeDefaults(patch.adapterType ?? existing.adapterType, patch.adapterConfig ?? existing.adapterConfig, patch.permissions ?? existing.permissions, "approval_activation");
++                    const safe = applyNewAgentSafeDefaults(patch.adapterType ?? existing.adapterType, patch.adapterConfig ?? existing.adapterConfig, patch.permissions ?? existing.permissions, "approval_activation", { storedEnv: isPlainRecord(existing.adapterConfig) ? existing.adapterConfig.env : null });
 +                    if (patch.adapterConfig !== undefined)
 +                        patch.adapterConfig = safe.adapterConfig;
 +                    patch.permissions = safe.permissions;
@@ -271,7 +300,7 @@
                  const updated = await tx
                      .update(agents)
                      .set({ ...patch, status: "idle", updatedAt: new Date() })
-@@ -918,7 +1141,7 @@
+@@ -918,7 +1170,7 @@
                      });
                  }
                  await syncAgentSecretBindings(updated, txDb, existing.adapterConfig);

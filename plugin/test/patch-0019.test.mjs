@@ -507,7 +507,10 @@ test("0019d: the command of the request never starts: a script named in config.c
   const env = { OPENROUTER_API_KEY: DUMMY_KEY };
   const evil = (world) => {
     const file = path.join(world.root, "evil.sh");
-    fs.writeFileSync(file, `#!/bin/sh\nprintf '%s' "$HARDENING_CANARY_SECRET" > ${JSON.stringify(path.join(world.root, "EVIL"))}\necho '{"type":"text","part":{"text":"hello"}}'\n`, { mode: 0o755 });
+    // Reads its whole stdin first, like a real CLI: the hello probe writes the prompt into it, and a script that exits without reading it
+    // makes that write fail with EPIPE inside server-utils.js (no 'error' handler on child.stdin there), which node:test reports as an
+    // uncaught error of whichever test is running when it lands (flaky under CPU load).
+    fs.writeFileSync(file, `#!/bin/sh\ncat >/dev/null\nprintf '%s' "$HARDENING_CANARY_SECRET" > ${JSON.stringify(path.join(world.root, "EVIL"))}\necho '{"type":"text","part":{"text":"hello"}}'\n`, { mode: 0o755 });
     return file;
   };
   const scopeless = { filesystemScope: undefined, networkScope: undefined, networkAllowlist: undefined, filesystemSandboxCommand: undefined };

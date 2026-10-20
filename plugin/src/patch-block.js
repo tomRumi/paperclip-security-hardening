@@ -49,8 +49,9 @@ export function withoutBlock(text, id) {
  *   globals: the object a block's own `globalThis` writes (defineProperty, assignment) land in, returned as `globals`; reads fall
  *   back to the real globalThis, so a block that only looks at a process-wide flag sees the real one. The real globalThis is
  *   never written, so evaluating a block (the self-test does, in the plugin worker) does not leave anything behind.
+ *   extraExports: more names of the block to return (tests; a name the block does not define throws a ReferenceError)
  */
-export function evalBlock(code, id, { env = {}, instanceRoot = "/nonexistent-instance-root", uid = process.getuid?.(), globals = {} } = {}) {
+export function evalBlock(code, id, { env = {}, instanceRoot = "/nonexistent-instance-root", uid = process.getuid?.(), globals = {}, extraExports = [] } = {}) {
   const warnings = [];
   const logger = { warn: (obj, msg) => warnings.push({ obj, msg }), info() {}, error() {}, debug() {} };
   const isPlainRecord = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -68,7 +69,7 @@ export function evalBlock(code, id, { env = {}, instanceRoot = "/nonexistent-ins
     readHardeningConfigFile: fs.readFileSync, // the live (older) patch blocks still read the file this way
     hardeningInstanceRoot: () => instanceRoot,
   };
-  const names = BLOCKS[id].exports;
+  const names = [...BLOCKS[id].exports, ...extraExports];
   // eslint-disable-next-line no-new-func
   const fn = new Function(...Object.keys(scope), `"use strict";\n${code}\nreturn { ${names.join(", ")} };`);
   return { ...fn(...Object.values(scope)), warnings, globals };

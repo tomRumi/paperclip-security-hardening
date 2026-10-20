@@ -17,7 +17,7 @@ Run as the agent user unless noted. The plugin's self-test (Hardening page, "Run
    * `claude_local` and `opencode_local` with `filesystemScope: "workspace"`, a `networkScope` and (Claude) `engine: "cli"`: the run starts.
    * The same agent with `filesystemScope` removed, `engine: "acp"` (Claude), or `networkScope` removed: refused, and the message names the missing piece.
    * `hermes_local` without the wrapper as `command`: refused. With a `hermesCommand` that is not the wrapper: refused.
-   * `codex_local`, `gemini_local`, `cursor`, `pi_local`, `kimi_local`, `grok_local`: refused ("not registered as boxed in this server"), even with the box settings. This is expected in v0.2.x.
+   * `codex_local`, `gemini_local`, `cursor`, `pi_local`, `kimi_local`, `grok_local`: refused ("not registered as boxed in this server"), even with the box settings. This is expected in v0.2.x. The refusal text shows once the agent has a credential bound; an agent without credentials first fails with the adapter's own "no credentials" error (for Codex `configuration_incomplete`).
    * `http`, `process`, `cursor_cloud`, `openclaw_gateway`, `hermes_gateway`: refused until the agent is listed under Remote exceptions; after the line is saved the next run starts (no restart) and the log shows `sandbox_remote_exception_used`. Removing the line refuses it again. Any other type stays refused with an exception too.
 
 ## Cleared environment and credentials
