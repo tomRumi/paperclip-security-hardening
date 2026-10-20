@@ -1,0 +1,43 @@
+--- a/node_modules/@paperclipai/server/dist/services/heartbeat.js
++++ b/node_modules/@paperclipai/server/dist/services/heartbeat.js
+@@ -881,6 +881,29 @@
+     };
+ }
+ const INLINE_BASE64_IMAGE_DATA_RE = /("type":"image","source":\{"type":"base64","data":")([A-Za-z0-9+/=]{1024,})(")/g;
++// LOCAL-PATCH 0005b: fail closed. A local run only starts for an agent whose STORED config is sandboxed. Only the
++// claude_local adapter implements filesystemScope; hermes_local is sandboxed by its launcher script;
++// every other adapter type has no sandbox implementation here, so it is refused.
++function refuseUnsandboxedLocalAgent(input) {
++    const stored = parseObject(input.agent.adapterConfig);
++    const adapterType = input.agent.adapterType;
++    let refusal = null;
++    if (adapterType === "claude_local") {
++        if (!stored.filesystemScope)
++            refusal = `${adapterType} agent has no filesystemScope in its stored adapterConfig`;
++    }
++    else if (adapterType === "hermes_local") {
++        if (stored.command !== "/usr/local/bin/hermes-sandbox")
++            refusal = "hermes_local agent command is not /usr/local/bin/hermes-sandbox";
++    }
++    else {
++        refusal = `adapter type "${adapterType}" has no sandbox implementation`;
++    }
++    if (!refusal)
++        return;
++    logger.warn({ event: "sandbox_enforcement", action: "refuse_unsandboxed", agentId: input.agent.id, runId: input.runId, adapterType }, `sandbox enforcement: refused run, ${refusal}`);
++    throw new Error(`Sandbox policy: run refused, ${refusal}. Agents must run sandboxed; the board must set the sandbox config (PATCH /agents/:id adapterConfig) before this agent can run.`);
++}
+ function formatMissingBindingForOperator(missing) {
+     if (missing.bindingType === "user_secret_ref") {
+         const definitionLabel = missing.userSecretDefinitionName
+@@ -18035,6 +18058,10 @@
+                             agent,
+                             runId: run.id,
+                         });
++                        // LOCAL-PATCH 0005b
++                        if (!executionTarget || executionTarget.kind === "local") {
++                            refuseUnsandboxedLocalAgent({ agent, runId: run.id });
++                        }
+                         const runtimeToolDelivery = adapter.runtimeToolDelivery ?? "invocation_context";
+                         if (runtimeTools && runtimeToolDelivery === "native_mcp") {
+                             runtimeMcpServers.unshift({

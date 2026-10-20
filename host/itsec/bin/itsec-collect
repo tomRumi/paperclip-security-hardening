@@ -1,0 +1,60 @@
+#!/usr/bin/python3 -I
+"""itsec-collect: deterministic collector (every 15 min). No LLM. Usage: itsec-collect [--config F] [--dry-run] [--rebaseline] [--list-outbox] [--drop-outbox KEY...]"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+from itsec import collect as C                       # noqa: E402
+from itsec.core import State, append_findings, load_config, prune_findings   # noqa: E402
+from itsec.notify import LogNotifier, build_notifier          # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=os.environ.get("ITSEC_CONFIG", "/etc/itsec/config.json"))
+    ap.add_argument("--dry-run", action="store_true", help="print findings; no state write, no delivery")
+    ap.add_argument("--rebaseline", action="store_true", help="relearn baselines (keeps dedup memory)")
+    ap.add_argument("--list-outbox", action="store_true", help="print the undelivered alerts (dedup key and title) and exit")
+    ap.add_argument("--drop-outbox", nargs="+", metavar="KEY", help="remove these EXACT dedup keys from the outbox and exit")
+    a = ap.parse_args()
+    cfg = load_config(a.config if os.path.exists(a.config) else None)
+    state = State(cfg["state_dir"])
+    if a.list_outbox or a.drop_outbox:
+        if a.drop_outbox:
+            removed = C.drop_outbox(state, a.drop_outbox)
+            if removed:
+                state.save()
+            for k in removed:
+                print(f"dropped {k}")
+            for k in sorted(set(a.drop_outbox) - set(removed)):
+                print(f"not in outbox: {k}", file=sys.stderr)
+        for k, title in C.list_outbox(state):
+            print(f"{k}\t{title}")
+        return 0
+    if a.rebaseline:
+        state.set("baselined", False)
+    notifier = LogNotifier("/dev/null") if a.dry_run else build_notifier(cfg)
+    if a.dry_run:
+        notifier.send = lambda alert: (False, "dry-run")
+    findings, sent, failed = C.collect(cfg, state, notifier)
+    if a.dry_run:
+        for f in findings:
+            print(f["severity"], f["rule"], f["title"])
+        return 0
+    append_findings(cfg["state_dir"], findings)
+    prune_findings(cfg["state_dir"], cfg["findings_retention_days"])
+    state.save()
+    print(f"findings={len(findings)} high_sent={len(sent)} delivery_failed={len(failed)}")
+    hb = getattr(notifier, "heartbeat", None)          # the plugin channel: "still alive" for the Hardening page
+    if callable(hb):
+        ok, info = hb({"findings": len(findings), "highSent": len(sent), "deliveryFailed": len(failed)})
+        if not ok:
+            print(f"heartbeat failed: {info}", file=sys.stderr)
+    for key, info in failed:
+        print(f"delivery failed for {key}: {info}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

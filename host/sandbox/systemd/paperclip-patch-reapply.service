@@ -1,0 +1,12 @@
+# TEMPLATE (user unit, runs as the agent user). Install as ~/.config/systemd/user/paperclip-patch-reapply.service
+# Re-applies the hardening patches after a Paperclip update; restarts paperclipai only if it applied something; on a patch that
+# no longer fits it restarts NOTHING and (if configured) opens one Paperclip issue. Writes patch-status.json for the plugin.
+[Unit]
+Description=Re-apply Paperclip security-hardening patches after an update
+
+[Service]
+Type=oneshot
+# Adjust the install path of this package. Optional alerting (all three are needed to open an issue):
+#   Environment=PAPERCLIP_API_URL=PAPERCLIP_API_URL  PAPERCLIP_ALERT_COMPANY_ID=<company id>  PAPERCLIP_ALERT_TOKEN_FILE=%h/.config/paperclip-alert/token   (token of a low-privilege member, NOT a board token)
+Environment=PAPERCLIP_SECURITY_APPLY=/opt/paperclip-security-hardening/host/patches/apply.sh
+ExecStart=/opt/paperclip-security-hardening/host/sandbox/paperclip-patch-reapply.sh

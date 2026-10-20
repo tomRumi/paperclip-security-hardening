@@ -1,0 +1,74 @@
+--- a/node_modules/@paperclipai/adapter-claude-local/dist/server/execute.js
++++ b/node_modules/@paperclipai/adapter-claude-local/dist/server/execute.js
+@@ -32,6 +32,20 @@
+         loginUrl: input.loginUrl,
+     };
+ }
++// LOCAL-PATCH 0016: per-agent Claude config dir (mode 0700). Seeded once, only when settings.json is absent, with the
++// shared settings.json reduced to its "theme": that file was agent-writable until now, so hooks or other keys found
++// there are never propagated. Credentials, projects/, sessions/ and everything else are never copied.
++async function ensurePerAgentClaudeConfigDir(configDir, sharedConfigDir) {
++    await fs.mkdir(configDir, { recursive: true, mode: 0o700 });
++    await fs.chmod(path.dirname(configDir), 0o700);
++    await fs.chmod(configDir, 0o700);
++    const shared = await fs.readFile(path.join(sharedConfigDir, "settings.json"), "utf8").then((text) => JSON.parse(text), () => null);
++    const seed = shared && typeof shared === "object" && typeof shared.theme === "string" ? { theme: shared.theme } : {};
++    await fs.writeFile(path.join(configDir, "settings.json"), `${JSON.stringify(seed, null, 2)}\n`, { flag: "wx", mode: 0o600 }).catch((error) => {
++        if (error?.code !== "EEXIST")
++            throw error;
++    });
++}
+ function hasNonEmptyEnvValue(env, key) {
+     const raw = env[key];
+     return typeof raw === "string" && raw.trim().length > 0;
+@@ -370,6 +384,9 @@
+     });
+     const localMcpConfigDir = path.dirname(localMcpConfigPath);
+     const sharedClaudeConfigDir = config.managedAiConnection ? asString(configEnv.CLAUDE_CONFIG_DIR, "") : resolveSharedClaudeConfigDir(process.env);
++    // LOCAL-PATCH 0016: a sandboxed agent gets its OWN Claude config dir (transcripts, settings, hooks) under its runtime
++    // state dir instead of the one shared, read-write, by every agent of every company. Auth is CLAUDE_CODE_OAUTH_TOKEN.
++    const sandboxClaudeConfigDir = config.managedAiConnection ? sharedClaudeConfigDir : path.join(claudeRuntimeStateDir, "home", ".claude");
+     const networkScope = parseLocalProcessNetworkScope(config.networkScope);
+     const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
+     const localProcessSandbox = (filesystemScope || networkScope) && !executionTargetIsRemote
+@@ -377,13 +394,13 @@
+             workspaceDir: effectiveExecutionCwd,
+             filesystemScope,
+             managedPaths: [
+-                { path: sharedClaudeConfigDir, access: "rw" },
+-                { path: path.join(path.dirname(sharedClaudeConfigDir), ".claude.json"), access: "rw" },
++                { path: sandboxClaudeConfigDir, access: "rw" }, // LOCAL-PATCH 0016
++                { path: path.join(path.dirname(sandboxClaudeConfigDir), ".claude.json"), access: "rw" }, // LOCAL-PATCH 0016
+                 { path: promptBundle.addDir, access: "ro" },
+                 { path: localMcpConfigDir, access: "ro" },
+             ],
+             extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
+-            homeDir: filesystemScope ? path.dirname(sharedClaudeConfigDir) : null,
++            homeDir: filesystemScope ? path.dirname(sandboxClaudeConfigDir) : null, // LOCAL-PATCH 0016
+             networkScope,
+             networkAllowlist: parseLocalProcessNetworkAllowlist(config.networkAllowlist),
+             networkTrustedUrls: [
+@@ -394,7 +411,13 @@
+         }
+         : null;
+     if (localProcessSandbox) {
+-        if (filesystemScope)
++        // LOCAL-PATCH 0016: create the per-agent dir before the sandbox mounts it (missing paths are skipped there) and
++        // point Claude at it; network-only sandboxes too, so their transcripts stop landing in the shared dir.
++        if (!config.managedAiConnection) {
++            await ensurePerAgentClaudeConfigDir(sandboxClaudeConfigDir, sharedClaudeConfigDir);
++            env.CLAUDE_CONFIG_DIR = sandboxClaudeConfigDir;
++        }
++        else if (filesystemScope)
+             env.CLAUDE_CONFIG_DIR = sharedClaudeConfigDir;
+         const scopes = [filesystemScope ? "workspace filesystem" : null, networkScope ? `${networkScope} network` : null]
+             .filter(Boolean)
+@@ -1052,7 +1077,7 @@
+                     : "is unavailable";
+             await onLog("stdout", `[paperclip] Claude resume session "${sessionId}" ${reason}; retrying with a fresh session.\n`);
+             if (sessionErrorKind === "poisoned" && !executionTargetIsRemote) {
+-                const claudeConfigDir = resolveSharedClaudeConfigDir(effectiveEnv);
++                const claudeConfigDir = asString(env.CLAUDE_CONFIG_DIR, "") || resolveSharedClaudeConfigDir(effectiveEnv); // LOCAL-PATCH 0016: the dir this run really used
+                 // Mirrors Claude Code's project-dir encoding: non-alphanumeric chars become "-"; existing hyphens pass through.
+                 const encodedCwd = effectiveExecutionCwd.replace(/[^a-zA-Z0-9-]/g, "-");
+                 const poisonedJsonlPath = path.join(claudeConfigDir, "projects", encodedCwd, `${sessionId}.jsonl`);

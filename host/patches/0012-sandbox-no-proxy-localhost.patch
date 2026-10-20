@@ -1,0 +1,13 @@
+--- a/node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js
++++ b/node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js
+@@ -427,6 +427,10 @@
+         env.HTTPS_PROXY = proxyUrl;
+         env.http_proxy = proxyUrl;
+         env.https_proxy = proxyUrl;
++        // LOCAL-PATCH 0012: apps started inside the run listen on the run's private localhost; keep that traffic off the proxy.
++        // 127.0.0.1 / ::1 stay proxied on purpose: allowlisted host services (vault, memory) are reached through the proxy there.
++        for (const noProxyKey of ["NO_PROXY", "no_proxy"])
++            env[noProxyKey] = env[noProxyKey] ? `${env[noProxyKey]},localhost` : "localhost";
+     }
+     args.push("--chdir", cwd, "--", executable, ...executableArgs);
+     return { command: bwrapCommand, args, cwd: "/", env, cleanup };

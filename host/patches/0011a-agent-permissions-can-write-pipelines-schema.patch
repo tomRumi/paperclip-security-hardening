@@ -1,0 +1,10 @@
+--- a/node_modules/@paperclipai/shared/dist/validators/agent.js
++++ b/node_modules/@paperclipai/shared/dist/validators/agent.js
+@@ -225,6 +225,7 @@
+     canCreateAgents: z.boolean(),
+     canCreateSkills: z.boolean().optional(),
+     canAssignTasks: z.boolean(),
++    canWritePipelines: z.boolean().optional(), // LOCAL-PATCH 0011
+     trustPreset: trustPresetSchema.optional(),
+     authorizationPolicy: trustAuthorizationPolicySchema.optional(),
+ });

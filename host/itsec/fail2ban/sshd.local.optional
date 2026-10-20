@@ -1,0 +1,5 @@
+# OPTIONAL: install as /etc/fail2ban/filter.d/sshd.local ONLY if
+#   sudo fail2ban-regex "systemd-journal[journalmatch='_SYSTEMD_UNIT=ssh.service']" sshd
+# shows 0 matched lines (an older filter that only knows the "sshd" process name, not sshd-session / sshd-auth).
+[Definition]
+_daemon = sshd(?:-session|-auth)?

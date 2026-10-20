@@ -1,0 +1,109 @@
+--- a/node_modules/@paperclipai/server/dist/routes/pipelines.js
++++ b/node_modules/@paperclipai/server/dist/routes/pipelines.js
+@@ -13,6 +13,7 @@
+ import { assertCompanyAccess } from "./authz.js";
+ import { computePipelineHealth, deriveCaseType, issueDocumentKeySchema, PIPELINE_CASE_BODY_DOCUMENT_KEY, pipelineAutomationRetryRequestSchema, } from "@paperclipai/shared";
+ import { documentAnnotationService } from "../services/document-annotations.js";
++import { logger } from "../middleware/logger.js";
+ import { logActivity } from "../services/activity-log.js";
+ import { formatPipelineConversationBodyDocumentContextMarkdown, loadPipelineConversationBodyDocumentContext, } from "../services/pipeline-conversation-context.js";
+ import { resolveActorSourceTrustForIssue } from "../services/source-trust.js";
+@@ -493,6 +494,15 @@
+         throw unauthorized("Agent run id required");
+     await input.issuesSvc.assertCheckoutOwner(input.issue.id, actorAgentId, runId);
+ }
++// LOCAL-PATCH 0007: pipeline structure (pipeline definition, stages and their approval/automation settings, transitions,
++// guidance documents) is board-only. pipelines:write stays enough for case work (ingest, breakdown, case documents,
++// transitions of cases); an agent actor (agent key or run JWT) cannot rewrite the rules it works under.
++function denyAgentPipelineStructureMutation(req, operation) {
++    if (req.actor.type !== "agent")
++        return;
++    logger.warn({ event: "pipeline_structure_denied", operation, agentId: req.actor.agentId ?? null, runId: req.actor.runId ?? null, method: req.method, path: req.originalUrl }, "pipeline structure mutation denied for agent actor");
++    throw new HttpError(403, "Pipeline structure changes require a board user", { code: "pipeline_structure_board_only", operation });
++}
+ export function pipelineRoutes(db, options = {}) {
+     const router = Router();
+     const svc = pipelineService(db, options);
+@@ -570,6 +580,7 @@
+         res.json(await listCompanyCaseEvents(db, { companyId, types, limit, offset }));
+     });
+     router.post("/companies/:companyId/pipelines", validate(createPipelineSchema), async (req, res) => {
++        denyAgentPipelineStructureMutation(req, "create_pipeline");
+         const companyId = req.params.companyId;
+         assertPipelineCompanyAccess(req, companyId);
+         const actor = actorForMutation(req);
+@@ -829,6 +840,7 @@
+         });
+     });
+     router.patch("/pipelines/:pipelineId", validate(updatePipelineSchema), async (req, res) => {
++        denyAgentPipelineStructureMutation(req, "update_pipeline");
+         const pipelineId = req.params.pipelineId;
+         const companyId = await assertPipelineAccess(db, req, pipelineId);
+         await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
+@@ -850,6 +862,7 @@
+         res.json(updated);
+     });
+     router.post("/pipelines/:pipelineId/stages", validate(createStageSchema), async (req, res) => {
++        denyAgentPipelineStructureMutation(req, "create_stage");
+         const pipelineId = req.params.pipelineId;
+         const companyId = await assertPipelineAccess(db, req, pipelineId);
+         await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
+@@ -872,6 +885,7 @@
+         }
+     });
+     router.patch("/pipelines/:pipelineId/stages/:stageId", validate(updateStageSchema), async (req, res) => {
++        denyAgentPipelineStructureMutation(req, "update_stage");
+         const pipelineId = req.params.pipelineId;
+         const stageId = req.params.stageId;
+         const companyId = await assertPipelineAccess(db, req, pipelineId);
+@@ -885,6 +899,7 @@
+         }
+     });
+     router.patch("/pipelines/:pipelineId/stages/:stageId/automation-env", validate(updateStageAutomationEnvSchema), async (req, res) => {
++        denyAgentPipelineStructureMutation(req, "stage_automation_env");
+         const pipelineId = req.params.pipelineId;
+         const stageId = req.params.stageId;
+         const companyId = await assertPipelineAccess(db, req, pipelineId);
+@@ -900,6 +915,7 @@
+         }));
+     });
+     router.delete("/pipelines/:pipelineId/stages/:stageId", async (req, res) => {
++        denyAgentPipelineStructureMutation(req, "delete_stage");
+         const pipelineId = req.params.pipelineId;
+         const stageId = req.params.stageId;
+         const companyId = await assertPipelineAccess(db, req, pipelineId);
+@@ -915,6 +931,7 @@
+         res.json(result);
+     });
+     router.put("/pipelines/:pipelineId/transitions", validate(replaceTransitionsSchema), async (req, res) => {
++        denyAgentPipelineStructureMutation(req, "replace_transitions");
+         const pipelineId = req.params.pipelineId;
+         const companyId = await assertPipelineAccess(db, req, pipelineId);
+         await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
+@@ -947,6 +964,7 @@
+         res.json(row);
+     });
+     router.put("/pipelines/:pipelineId/documents/:key", validate(upsertPipelineDocumentSchema), async (req, res) => {
++        denyAgentPipelineStructureMutation(req, "put_pipeline_document");
+         const pipelineId = req.params.pipelineId;
+         const key = req.params.key;
+         const companyId = await assertPipelineAccess(db, req, pipelineId);
+@@ -1052,6 +1070,7 @@
+         res.json(revisions);
+     });
+     router.post("/pipelines/:pipelineId/documents/:key/revisions/:revisionId/restore", async (req, res) => {
++        denyAgentPipelineStructureMutation(req, "restore_pipeline_document");
+         const pipelineId = req.params.pipelineId;
+         const key = req.params.key;
+         const revisionId = req.params.revisionId;
+@@ -1547,6 +1566,10 @@
+         const caseId = req.params.caseId;
+         const companyId = await assertCaseAccess(db, req, caseId);
+         const actor = actorForMutation(req);
++        if (req.body.force && actor.type === "agent") { // LOCAL-PATCH 0007: force skips the transition graph / gates; board only (mirrors release)
++            logger.warn({ event: "pipeline_structure_denied", operation: "force_transition", agentId: req.actor.agentId ?? null, runId: req.actor.runId ?? null, method: req.method, path: req.originalUrl }, "forced case transition denied for agent actor");
++            throw new HttpError(403, "Agents cannot force case transitions", { code: "pipeline_structure_board_only", operation: "force_transition" });
++        }
+         res.json(await svc.transitionCase({
+             companyId,
+             caseId,

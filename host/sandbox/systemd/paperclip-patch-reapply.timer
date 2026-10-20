@@ -1,0 +1,10 @@
+# TEMPLATE (user unit). Safety net in case the path unit misses the symlink swap, and keeps patch-status.json fresh.
+[Unit]
+Description=Periodic check that the Paperclip hardening patches are applied
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,175 @@
+{
+  "state_dir": "/var/lib/itsec",
+  "admin_user": "admin",
+  "watched_user": "paperclip",
+  "failed_login_burst": 10,
+  "dedup_hours": 24,
+  "journal_first_run_since": "-3d",
+  "vault_audit_log": "/var/log/vault/audit.jsonl",
+  "vault_verify_from_genesis": true,
+  "findings_retention_days": 90,
+  "notifier": "paperclip",
+  "paperclip": {
+    "base_url": "http://PAPERCLIP_HOST:3100",
+    "company_id": "<company uuid>",
+    "assignee_user_id": "<board/owner user id>",
+    "token_file": "${CREDENTIALS_DIRECTORY}/paperclip-token",
+    "alert_company_id": "",
+    "alert_token_file": "",
+    "board_user_id": "",
+    "project_id": "",
+    "hmac_key_file": "${CREDENTIALS_DIRECTORY}/idempotency-secret",
+    "alert_recheck_days": 7
+  },
+  "claude": {
+    "command": "/usr/local/bin/claude",
+    "model": "",
+    "timeout_s": 180,
+    "token_file": "${CREDENTIALS_DIRECTORY}/claude-token"
+  },
+  "watch": [
+    {
+      "severity": "HIGH",
+      "globs": [
+        "/home/*/.ssh/authorized_keys",
+        "/home/*/.ssh/authorized_keys2",
+        "/root/.ssh/authorized_keys",
+        "/etc/ssh/sshd_config",
+        "/etc/ssh/sshd_config.d"
+      ]
+    },
+    {
+      "severity": "HIGH",
+      "globs": [
+        "/etc/sudoers",
+        "/etc/sudoers.d"
+      ]
+    },
+    {
+      "severity": "HIGH",
+      "globs": [
+        "/etc/systemd/system",
+        "/home/paperclip/.config/systemd/user"
+      ]
+    },
+    {
+      "severity": "HIGH",
+      "globs": [
+        "/etc/crontab",
+        "/etc/cron.d",
+        "/etc/cron.hourly",
+        "/etc/cron.daily",
+        "/etc/cron.weekly",
+        "/var/spool/cron/crontabs"
+      ]
+    },
+    {
+      "severity": "HIGH",
+      "globs": [
+        "/home/paperclip/.claude/settings.json",
+        "/home/paperclip/.claude/settings.local.json",
+        "/home/paperclip/.claude/hooks",
+        "/home/paperclip/.claude/CLAUDE.md"
+      ]
+    },
+    {
+      "severity": "HIGH",
+      "globs": [
+        "/home/paperclip/.paperclip/instances/default/companies/*/agents/*/.claude/settings*.json"
+      ]
+    },
+    {
+      "severity": "HIGH",
+      "globs": [
+        "/etc/cloud/cloud.cfg.d",
+        "/etc/cloud/cloud.cfg"
+      ]
+    },
+    {
+      "severity": "HIGH",
+      "globs": [
+        "/usr/local/bin",
+        "/usr/local/sbin"
+      ]
+    },
+    {
+      "severity": "HIGH",
+      "globs": [
+        "/home/paperclip/.paperclip/cli/current/node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js",
+        "/home/paperclip/.paperclip/cli/current/node_modules/@paperclipai/server/dist/routes/agents.js",
+        "/home/paperclip/.paperclip/cli/current/node_modules/@paperclipai/server/dist/services/heartbeat.js",
+        "/home/paperclip/.paperclip/cli/current/node_modules/@paperclipai/server/dist/services/agents.js",
+        "/home/paperclip/.paperclip/cli/current/node_modules/@paperclipai/server/dist/services/built-in-agents.js",
+        "/home/paperclip/.paperclip/cli/current/node_modules/@paperclipai/server/dist/services/authorization.js",
+        "/home/paperclip/.paperclip/cli/current/node_modules/@paperclipai/shared/dist/validators/agent.js",
+        "/home/paperclip/.paperclip/cli/current/node_modules/@paperclipai/server/dist/routes/pipelines.js",
+        "/home/paperclip/.paperclip/cli/current/node_modules/@paperclipai/server/dist/services/company-portability.js",
+        "/home/paperclip/.paperclip/cli/current/node_modules/@paperclipai/server/dist/services/agent-permissions.js"
+      ]
+    },
+    {
+      "severity": "MEDIUM",
+      "globs": [
+        "/etc/fail2ban/jail.local",
+        "/etc/ufw/user.rules",
+        "/etc/ufw/user6.rules"
+      ]
+    },
+    {
+      "severity": "HIGH",
+      "globs": [
+        "/home/paperclip/.bashrc",
+        "/home/paperclip/.profile",
+        "/home/paperclip/.bash_logout",
+        "/home/paperclip/.ssh/rc",
+        "/home/paperclip/.ssh/config",
+        "/home/paperclip/.config/environment.d",
+        "/home/paperclip/.local/bin",
+        "/home/paperclip/.config/systemd/user/paperclipai.service.d"
+      ]
+    },
+    {
+      "severity": "HIGH",
+      "globs": [
+        "/home/paperclip/.claude/skills",
+        "/home/paperclip/.claude/plugins",
+        "/home/paperclip/.claude/agents",
+        "/home/paperclip/.claude/commands"
+      ],
+      "exclude": [
+        "/home/paperclip/.claude/plugins/.last_inuse_sweep",
+        "/home/paperclip/.claude/plugins/plugin-directory-cache-v2.json",
+        "/home/paperclip/.claude/plugins/marketplaces/*/.gcs-sha",
+        "/home/paperclip/.claude/plugins/synced/*/*/.in_use",
+        "/home/paperclip/.claude/plugins/synced/*/.last-complete-round",
+        "/home/paperclip/.claude/skills/synced/*/.last-complete-round",
+        "/home/paperclip/.claude/plugins/synced/.bucket-*",
+        "/home/paperclip/.claude/skills/synced/.bucket-*"
+      ]
+    },
+    {
+      "severity": "HIGH",
+      "globs": [
+        "/etc/systemd/user",
+        "/etc/ld.so.preload",
+        "/etc/pam.d",
+        "/etc/profile.d",
+        "/etc/environment",
+        "/etc/polkit-1",
+        "/etc/apt/apt.conf.d",
+        "/etc/udev/rules.d",
+        "/var/lib/systemd/linger",
+        "/var/spool/cron/atjobs"
+      ]
+    }
+  ],
+  "patch_manifest": "/etc/itsec/patch-manifest.json",
+  "watched_uid": "1000",
+  "vault_uid": "",
+  "alert_cap_per_run": 10,
+  "known_restart_windows": [],
+  "disk_paths": [
+    "/",
+    "/var/log"
+  ]
+}

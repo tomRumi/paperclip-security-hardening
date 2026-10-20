@@ -1,0 +1,23 @@
+# OPTIONAL TEMPLATE. Lynis as itsec (--pentest) skips every test that needs root (shadow, sudoers, firewall rules,
+# many permission checks), so the weekly audit is low value on its own. This root unit runs the full audit and hands the
+# report to itsec; set "lynis_consume_root_report": true in /etc/itsec/config.json so itsec-lynis only parses and diffs it.
+# Install as /etc/systemd/system/itsec-lynis-root.service and start it ~10 minutes before itsec-lynis.timer fires
+# (e.g. a drop-in timer for Sun 03:20 UTC). Skip this file entirely if the weaker non-root audit is enough.
+[Unit]
+Description=ITSec weekly Lynis audit (root, full tests; report handed to the itsec user)
+
+[Service]
+Type=oneshot
+User=root
+ExecStartPre=/usr/bin/install -d -m 0700 -o itsec -g itsec /var/lib/itsec/lynis
+ExecStart=/usr/bin/lynis audit system --quiet --no-colors --report-file /var/lib/itsec/lynis/report-new.dat --logfile /var/lib/itsec/lynis/lynis-root.log
+ExecStartPost=/usr/bin/chown -R itsec:itsec /var/lib/itsec/lynis
+TimeoutStartSec=3600
+Nice=15
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/itsec/lynis
+IPAddressDeny=any

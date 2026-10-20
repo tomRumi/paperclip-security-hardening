@@ -1,0 +1,13 @@
+--- a/node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js
++++ b/node_modules/@paperclipai/adapter-utils/dist/local-process-sandbox.js
+@@ -320,7 +320,9 @@
+                 const relative = path.relative(restorePath, normalizedExtraPath);
+                 return !relative.startsWith("..") && !path.isAbsolute(relative);
+             });
+-            if (!synchronized && !restored) {
++            // LOCAL-PATCH 0006: git common dirs validated by the server (heartbeat.js) at spawn time
++            const gitCommonDir = globalThis[Symbol.for("paperclip.localPatch0006.gitCommonDirs")]?.has(normalizedExtraPath) === true;
++            if (!synchronized && !restored && !gitCommonDir) {
+                 throw new Error(`Writable sandbox path "${normalizedExtraPath}" is outside synchronized workspace "${workspaceDir}" and has no outbound restore mapping.`);
+             }
+         }

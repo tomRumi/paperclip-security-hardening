@@ -1,0 +1,204 @@
+--- a/node_modules/@paperclipai/server/dist/services/agents.js
++++ b/node_modules/@paperclipai/server/dist/services/agents.js
+@@ -8,6 +8,10 @@
+ import { collectSecretRefs, collectUserSecretRefs, syncAgentAdapterEnvBindings, } from "./agent-secret-bindings.js";
+ import { logActivity } from "./activity-log.js";
+ import { normalizeAgentPermissions } from "./agent-permissions.js";
++import { logger } from "../middleware/logger.js";
++import * as hardeningFs from "node:fs"; // LOCAL-PATCH 0005a
++import hardeningPath from "node:path"; // LOCAL-PATCH 0005a
++import { resolvePaperclipInstanceRoot as hardeningInstanceRoot } from "../home-paths.js"; // LOCAL-PATCH 0005a
+ import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
+ import { assertClaudeOAuthBindingInvariant, claudeOAuthBindingsMatchExactly, claudeOAuthClaimRejectedError, CLAUDE_LOCAL_ADAPTER_TYPE, readClaudeOAuthBinding, secretService, } from "./secrets.js";
+ import { createDbSetupTokenCleanupStore } from "./setup-token-session.js";
+@@ -40,6 +44,156 @@
+ function jsonEqual(left, right) {
+     return JSON.stringify(left) === JSON.stringify(right);
+ }
++// LOCAL-PATCH 0005a: safe defaults for every NEW agent row (direct create, hire/approval materialisation, join request,
++// built-in agents all pass through create(); a pending hire is activated through activatePendingApproval()). The
++// defaults OVERRIDE whatever the creator supplied for these keys; later board PATCHes (updateAgent) are not touched,
++// so extra hosts / paths are added afterwards by the board. Edited here (server-side code), never agent-writable.
++// Site values come from the hardening settings file, read once at startup (written by the Security hardening plugin, never
++// agent-writable; ignored unless it passes the location and ownership checks below): $PAPERCLIP_HARDENING_CONFIG, else
++// <instance root>/hardening/config.json. Keys, and the default without one:
++//   baseAllowlist        claude_local network allowlist (the model API host only; the Paperclip API is always reachable)
++//   extraReadOnlyPaths   claude_local extra read-only paths (none)
++//   hermesWrapperPath    hermes_local command (/usr/local/bin/hermes-sandbox)
++//   hermesAllowlist      hermes_local HERMES_SANDBOX_ALLOW (the model API host only)
++//   hermesReadOnlyPaths  hermes_local HERMES_SANDBOX_RO (unset: the wrapper keeps its own Hermes install dirs)
++// The settings file is trusted for allowlists and read-only paths, so it is used only when no agent run can have written it.
++// Its real path must not lie inside <instance root>/workspaces, /projects or /companies (the adapters bind the workspace and
++// companies/<company>/agents/<agent>/claude-runtime and codex-home read-write) nor inside a workspace root (the roots below,
++// from the file itself or $PAPERCLIP_SANDBOX_WORKSPACE_ROOT: whatever a run may use as its writable workspace). The file must
++// be a regular file owned by the user this server runs as with mode 0600, and its directory owned by that user and not
++// group- or world-writable. Otherwise the file is ignored: the secure built-in defaults stay in force. The path is
++// $PAPERCLIP_HARDENING_CONFIG (the environment or the first .env the server loaded) as is, else the instance root, which is
++// the one Paperclip itself resolved from --instance / --data-dir / PAPERCLIP_HOME / PAPERCLIP_INSTANCE_ID.
++function hardeningRootList0005a(value) {
++    return value.split(hardeningPath.delimiter)
++        .map((root) => root.trim())
++        .filter((root) => hardeningPath.isAbsolute(root))
++        .map((root) => hardeningPath.resolve(root));
++}
++function hardeningInside0005a(dir, target) {
++    const rel = hardeningPath.relative(dir, target);
++    return rel === "" || (rel !== ".." && !rel.startsWith(`..${hardeningPath.sep}`) && !hardeningPath.isAbsolute(rel));
++}
++function hardeningRefusal0005a(file, real, st, candidate) {
++    if (typeof process.getuid !== "function")
++        return "file ownership cannot be checked on this platform";
++    const writable = [
++        ...["workspaces", "projects", "companies"].map((dir) => hardeningPath.join(hardeningInstanceRoot(), dir)),
++        ...hardeningRootList0005a(Array.isArray(candidate.workspaceRoots) ? candidate.workspaceRoots.filter((root) => typeof root === "string").join(hardeningPath.delimiter) : ""),
++        ...hardeningRootList0005a(process.env.PAPERCLIP_SANDBOX_WORKSPACE_ROOT ?? ""),
++    ];
++    for (const root of writable) {
++        let realRoot = root;
++        try {
++            realRoot = hardeningFs.realpathSync(root);
++        }
++        catch { /* not created yet */ }
++        if ([root, realRoot].some((dir) => hardeningInside0005a(dir, file) || hardeningInside0005a(dir, real)))
++            return `it lies inside ${root}, which sandboxed runs can write`;
++    }
++    if (!st.isFile() || st.uid !== process.getuid() || (st.mode & 0o777) !== 0o600)
++        return "it must be a regular file owned by the service user with mode 0600";
++    const dir = hardeningFs.lstatSync(hardeningPath.dirname(real));
++    if (!dir.isDirectory() || dir.uid !== process.getuid() || (dir.mode & 0o022) !== 0)
++        return "its directory must be owned by the service user and not writable by group or others";
++    return null;
++}
++function readHardeningConfig0005a() {
++    let file = process.env.PAPERCLIP_HARDENING_CONFIG;
++    try {
++        file = file || hardeningPath.join(hardeningInstanceRoot(), "hardening", "config.json");
++        const ignore = (reason) => {
++            logger.warn({ event: "sandbox_enforcement", action: "ignore_hardening_config", file, reason }, `sandbox enforcement: hardening settings file ignored, ${reason}; using the secure defaults`);
++            return {};
++        };
++        if (!hardeningPath.isAbsolute(file) || file.includes("\0"))
++            return ignore("its path is not absolute");
++        // Never follow a link in the last path part, and take the location from the open file itself: the checks below are
++        // about the very inode that is read, with no gap between a path check and the open.
++        let fd;
++        try {
++            fd = hardeningFs.openSync(file, hardeningFs.constants.O_RDONLY | hardeningFs.constants.O_NOFOLLOW | hardeningFs.constants.O_NONBLOCK);
++        }
++        catch (err) {
++            if (err?.code === "ELOOP")
++                return ignore("it is a symbolic link; it must be a regular file owned by the service user with mode 0600");
++            throw err;
++        }
++        let real;
++        let st;
++        let text = "";
++        try {
++            st = hardeningFs.fstatSync(fd);
++            real = hardeningFs.readlinkSync(`/proc/self/fd/${fd}`);
++            if (st.isFile())
++                text = hardeningFs.readFileSync(fd, "utf8");
++        }
++        finally {
++            hardeningFs.closeSync(fd);
++        }
++        let candidate = {};
++        try {
++            candidate = JSON.parse(text);
++        }
++        catch { /* reported below, once the file is trusted */ }
++        const refusal = hardeningRefusal0005a(file, real, st, candidate && typeof candidate === "object" && !Array.isArray(candidate) ? candidate : {});
++        if (refusal)
++            return ignore(refusal);
++        const parsed = JSON.parse(text);
++        if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
++            return parsed;
++        logger.warn({ event: "hardening_config", file }, "hardening settings file is not a JSON object; using defaults");
++    }
++    catch (err) {
++        if (err?.code !== "ENOENT")
++            logger.warn({ event: "hardening_config", file, err: err?.message }, "hardening settings file is unreadable; using defaults");
++    }
++    return {};
++}
++const SAFE_SETTINGS = readHardeningConfig0005a();
++const safeSettingList = (value, absolute = false) => Array.isArray(value)
++    ? value.filter((s) => typeof s === "string" && s.trim() && (!absolute || s.trim().startsWith("/"))).map((s) => s.trim())
++    : null;
++const NEW_AGENT_SAFE_DEFAULTS = {
++    canCreateAgents: false,
++    filesystemScope: "workspace",
++    filesystemSandboxCommand: "/usr/bin/bwrap",
++    filesystemExtraPaths: safeSettingList(SAFE_SETTINGS.extraReadOnlyPaths, true) ?? [],
++    networkScope: "allowlist",
++    networkAllowlist: safeSettingList(SAFE_SETTINGS.baseAllowlist) ?? ["api.anthropic.com"],
++    hermesCommand: typeof SAFE_SETTINGS.hermesWrapperPath === "string" && SAFE_SETTINGS.hermesWrapperPath.startsWith("/")
++        ? SAFE_SETTINGS.hermesWrapperPath : "/usr/local/bin/hermes-sandbox",
++    // The wrapper reads these from adapterConfig.env.
++    hermesSandboxAllow: (safeSettingList(SAFE_SETTINGS.hermesAllowlist) ?? ["openrouter.ai"]).join(","),
++    // hermes-sandbox replaces its default read-only set (Hermes install) when this is set; null keeps the wrapper's own.
++    hermesSandboxRo: safeSettingList(SAFE_SETTINGS.hermesReadOnlyPaths, true)?.join(",") ?? null,
++};
++function applyNewAgentSafeDefaults(adapterType, adapterConfig, permissions, source) {
++    const nextPermissions = { ...(isPlainRecord(permissions) ? permissions : {}), canCreateAgents: NEW_AGENT_SAFE_DEFAULTS.canCreateAgents, canCreateSkills: false };
++    let nextConfig = isPlainRecord(adapterConfig) ? { ...adapterConfig } : {};
++    if (adapterType === "claude_local") {
++        nextConfig = {
++            ...nextConfig,
++            filesystemScope: NEW_AGENT_SAFE_DEFAULTS.filesystemScope,
++            filesystemSandboxCommand: NEW_AGENT_SAFE_DEFAULTS.filesystemSandboxCommand,
++            filesystemExtraPaths: [...NEW_AGENT_SAFE_DEFAULTS.filesystemExtraPaths],
++            networkScope: NEW_AGENT_SAFE_DEFAULTS.networkScope,
++            networkAllowlist: [...NEW_AGENT_SAFE_DEFAULTS.networkAllowlist],
++        };
++    }
++    else if (adapterType === "hermes_local") {
++        // env values are stored as { type: "plain", value } bindings (a bare string is also accepted by the resolver).
++        const env = isPlainRecord(nextConfig.env) ? { ...nextConfig.env } : {};
++        env.HERMES_SANDBOX_ALLOW = { type: "plain", value: NEW_AGENT_SAFE_DEFAULTS.hermesSandboxAllow };
++        if (NEW_AGENT_SAFE_DEFAULTS.hermesSandboxRo === null)
++            delete env.HERMES_SANDBOX_RO;
++        else
++            env.HERMES_SANDBOX_RO = { type: "plain", value: NEW_AGENT_SAFE_DEFAULTS.hermesSandboxRo };
++        nextConfig = { ...nextConfig, command: NEW_AGENT_SAFE_DEFAULTS.hermesCommand, env };
++    }
++    logger.warn({ event: "new_agent_defaults", adapterType, source }, "new agent: sandbox and permission defaults applied (creator-supplied values for these keys are ignored)");
++    return { adapterConfig: nextConfig, permissions: nextPermissions };
++}
+ function buildConfigSnapshot(row) {
+     const adapterConfig = typeof row.adapterConfig === "object" && row.adapterConfig !== null && !Array.isArray(row.adapterConfig)
+         ? sanitizeRecord(row.adapterConfig)
+@@ -675,6 +829,8 @@
+                 nextConfig: adapterConfig,
+                 priorConfig: null,
+             });
++            // LOCAL-PATCH 0005a
++            const safeDefaults = applyNewAgentSafeDefaults(adapterType, adapterConfig, normalizedPermissions, "create");
+             return db.transaction(async (tx) => {
+                 const txDb = tx;
+                 // Consume the stored-session claim and create the fixed definition inside
+@@ -697,8 +853,8 @@
+                     companyId,
+                     role,
+                     adapterType,
+-                    adapterConfig,
+-                    permissions: normalizedPermissions,
++                    adapterConfig: safeDefaults.adapterConfig,
++                    permissions: safeDefaults.permissions,
+                     runtimeConfig,
+                 })
+                     .returning()
+@@ -883,6 +1039,13 @@
+                     // request, so the new-agent creation default applies.
+                     patch.permissions = normalizeAgentPermissions(patch.permissions, { context: "create" });
+                 }
++                // LOCAL-PATCH 0005a: the approval payload carries the redacted display copy and the requester's values.
++                if (patch.adapterConfig !== undefined || patch.permissions !== undefined) {
++                    const safe = applyNewAgentSafeDefaults(patch.adapterType ?? existing.adapterType, patch.adapterConfig ?? existing.adapterConfig, patch.permissions ?? existing.permissions, "approval_activation");
++                    if (patch.adapterConfig !== undefined)
++                        patch.adapterConfig = safe.adapterConfig;
++                    patch.permissions = safe.permissions;
++                }
+                 const updated = await tx
+                     .update(agents)
+                     .set({ ...patch, status: "idle", updatedAt: new Date() })

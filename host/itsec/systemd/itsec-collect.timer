@@ -1,0 +1,12 @@
+# TEMPLATE. Install as /etc/systemd/system/itsec-collect.timer
+[Unit]
+Description=ITSec collector every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+RandomizedDelaySec=30
+Persistent=yes
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,73 @@
+--- a/node_modules/@paperclipai/server/dist/services/heartbeat.js
++++ b/node_modules/@paperclipai/server/dist/services/heartbeat.js
+@@ -304,6 +304,54 @@
+ ];
+ const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"];
+ export { ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS, ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS, ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS, } from "./recovery/service.js";
++// LOCAL-PATCH 0006: a git worktree's .git is a FILE pointing into the project repo's common git dir, which the workspace sandbox does
++// not mount (so git fails). For this run only, and derived from the worktree (nothing stored on the agent), mount that common dir
++// read-write when it is inside the allowed workspace roots, with read-only overlays on everything git would execute or trust on the
++// host side (hooks, config, info, per-worktree config). The sandbox's outbound-restore check is told about the dir (0006 in adapter-utils).
++async function addGitCommonDirToSandbox(input) {
++    const cfg = input.runtimeConfig;
++    if (cfg.filesystemScope !== "workspace")
++        return cfg;
++    const extra = [];
++    for (const dir of new Set(input.dirs.filter((d) => typeof d === "string" && d.length > 0))) {
++        try {
++            const gitFile = path.join(dir, ".git");
++            if (!(await fs.lstat(gitFile)).isFile())
++                continue;
++            const match = /^gitdir:\s*(.+?)\s*$/m.exec(await fs.readFile(gitFile, "utf8"));
++            if (!match)
++                continue;
++            const gitdir = await fs.realpath(path.resolve(dir, match[1]));
++            let common = gitdir;
++            try {
++                common = path.resolve(gitdir, (await fs.readFile(path.join(gitdir, "commondir"), "utf8")).trim());
++            }
++            catch { /* no commondir: the gitdir is the common dir */ }
++            common = await fs.realpath(common);
++            const within = path.relative(common, gitdir);
++            if (within.startsWith("..") || path.isAbsolute(within))
++                continue;
++            await assertSandboxWorkspaceAllowed("git common dir", common);
++            for (const name of ["hooks", "info"])
++                await fs.mkdir(path.join(common, name), { recursive: true });
++            const ro = [path.join(common, "hooks"), path.join(common, "config"), path.join(common, "info")];
++            for (const entry of await fs.readdir(path.join(common, "worktrees")).catch(() => [])) {
++                const wtConfig = path.join(common, "worktrees", entry, "config.worktree");
++                if (await fs.lstat(wtConfig).then(() => true, () => false))
++                    ro.push(wtConfig);
++            }
++            extra.push({ path: common, access: "rw" }, ...ro.map((p) => ({ path: p, access: "ro" })));
++            (globalThis[Symbol.for("paperclip.localPatch0006.gitCommonDirs")] ??= new Set()).add(common);
++            logger.warn({ event: "sandbox_git_common_dir", agentId: input.agentId, runId: input.runId, workspace: dir, commonDir: common }, `sandbox: mounted git common dir ${common} read-write (hooks/config/info read-only) for worktree ${dir}`);
++        }
++        catch (err) {
++            logger.warn({ event: "sandbox_git_common_dir", action: "skipped", agentId: input.agentId, runId: input.runId, workspace: dir, reason: String(err?.message ?? err) }, `sandbox: git common dir not mounted for ${dir}: ${err?.message ?? err}`);
++        }
++    }
++    if (extra.length === 0)
++        return cfg;
++    return { ...cfg, filesystemExtraPaths: [...(Array.isArray(cfg.filesystemExtraPaths) ? cfg.filesystemExtraPaths : []), ...extra] };
++}
+ export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
+ export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
+ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
+@@ -18053,6 +18101,15 @@
+                                 runId: run.id,
+                             }, "runtime connection tools could not be delivered");
+                         }
++                        // LOCAL-PATCH 0006
++                        if ((!executionTarget || executionTarget.kind === "local") && agent.adapterType === "claude_local") {
++                            runtimeConfig = await addGitCommonDirToSandbox({
++                                agentId: agent.id,
++                                runId: run.id,
++                                runtimeConfig,
++                                dirs: [executionWorkspace.cwd, adapterContext.paperclipWorkspace?.cwd, runtimeConfig.cwd],
++                            });
++                        }
+                         const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
+                             db,
+                             agent,

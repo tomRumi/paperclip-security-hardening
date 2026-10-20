@@ -1,0 +1,42 @@
+#!/usr/bin/python3 -I
+"""itsec-plugin: talk to the Security hardening plugin's webhook (notifier "plugin"). Used by install-watchdog.sh.
+  itsec-plugin [--config F] [--key PEM] enrol      reads the one-time code from stdin (never from the command line)
+  itsec-plugin [--config F] [--key PEM] heartbeat
+  itsec-plugin [--config F] [--key PEM] unenrol
+Prints only "ok" or the error; never the code or any key. Exit 0 on success, 1 on failure, 2 on usage errors."""
+import argparse
+import os
+import socket
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+from itsec.core import load_config                  # noqa: E402
+from itsec.notify import PluginWebhookNotifier      # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=os.environ.get("ITSEC_CONFIG", "/etc/itsec/config.json"))
+    ap.add_argument("--key", help="private key file (default: plugin.key_file from the config)")
+    ap.add_argument("command", choices=["enrol", "heartbeat", "unenrol"])
+    a = ap.parse_args()
+    cfg = load_config(a.config if os.path.exists(a.config) else None)
+    p = cfg.get("plugin", {})
+    n = PluginWebhookNotifier(p.get("url", ""), p.get("install_id", ""), a.key or p.get("key_file", ""),
+                              openssl=p.get("openssl", "openssl"), version=p.get("version", ""))
+    if a.command == "enrol":
+        code = sys.stdin.readline().strip()
+        if not code:
+            print("no enrolment code on stdin", file=sys.stderr)
+            return 2
+        ok, info = n.enrol(code, host=socket.gethostname()[:253])
+    elif a.command == "heartbeat":
+        ok, info = n.heartbeat({})
+    else:
+        ok, info = n.unenrol()
+    print("ok" if ok else f"failed: {info}", file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,46 @@
+# TEMPLATE. Install as /etc/systemd/system/itsec-collect.service (see ../INSTALL.md). Code lives in /opt/itsec (root-owned).
+[Unit]
+Description=ITSec deterministic collector (no LLM)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=itsec
+Group=itsec
+# adm: auth.log; systemd-journal: whole journal incl. user units; vaultaudit: /var/log/vault (ACL, see INSTALL.md)
+SupplementaryGroups=adm systemd-journal vaultaudit
+Environment=ITSEC_CONFIG=/etc/itsec/config.json
+LoadCredential=paperclip-token:/etc/itsec/paperclip-token
+LoadCredential=idempotency-secret:/etc/itsec/idempotency-secret
+ExecStart=/opt/itsec/bin/itsec-collect
+TimeoutStartSec=600
+Nice=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/itsec
+StateDirectory=itsec
+StateDirectoryMode=0700
+UMask=0077
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# ps must see other users' processes (so no ProtectProc=invisible); ss needs a netlink socket.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+# nothing under /home is executed by this unit (the patch check reads files against /etc/itsec/patch-manifest.json).
+# Only the Paperclip API is reachable from this unit.
+IPAddressDeny=any
+IPAddressAllow=PAPERCLIP_HOST_IP 127.0.0.0/8

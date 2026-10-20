@@ -1,0 +1,20 @@
+#!/usr/bin/python3 -I
+"""itsec-lynis: weekly Lynis audit; the diff against the previous run goes to the findings store (daily report picks it up)."""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+from itsec.core import load_config      # noqa: E402
+from itsec.lynis import run_lynis       # noqa: E402
+
+
+def main():
+    p = os.environ.get("ITSEC_CONFIG", "/etc/itsec/config.json")
+    cfg = load_config(p if os.path.exists(p) else None)
+    for f in run_lynis(cfg):
+        print(f["severity"], f["rule"], f["title"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

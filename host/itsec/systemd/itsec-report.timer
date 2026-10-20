@@ -1,0 +1,11 @@
+# TEMPLATE. Install as /etc/systemd/system/itsec-report.timer
+[Unit]
+Description=ITSec daily report at 06:00 UTC
+
+[Timer]
+OnCalendar=*-*-* 06:00:00 UTC
+RandomizedDelaySec=60
+Persistent=yes
+
+[Install]
+WantedBy=timers.target

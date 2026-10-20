@@ -1,0 +1,10 @@
+# TEMPLATE (user unit). `paperclipai update` re-points the `current` symlink; this triggers the re-apply service.
+[Unit]
+Description=Watch for a new Paperclip install tree
+
+[Path]
+PathChanged=%h/.paperclip/cli/current
+Unit=paperclip-patch-reapply.service
+
+[Install]
+WantedBy=default.target

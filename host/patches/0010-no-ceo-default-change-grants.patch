@@ -1,0 +1,13 @@
+--- a/node_modules/@paperclipai/server/dist/services/built-in-agents.js
++++ b/node_modules/@paperclipai/server/dist/services/built-in-agents.js
+@@ -304,7 +304,9 @@
+ // a new user starts clean — the Reflection Coach and Summarizer are opt-in, not
+ // seeded. Add a definition key here to restore automatic provisioning.
+ const AUTO_PROVISION_ON_COMPANY_CREATE_KEYS = new Set([]);
+-const ROOT_AGENT_DEFAULT_CHANGE_GRANTS = ["agents:configure", "skills:create"];
++// LOCAL-PATCH 0010: the startup reconcile / ensureCompanyDefaultAgentGrants gave the root CEO agent agents:configure + skills:create
++// (setPrincipalPermission on every server start via reconcileBuiltInAgentsOnStartup, and after each agent create). Empty: ensureAgentDefaultGrants() returns 0 for no keys.
++const ROOT_AGENT_DEFAULT_CHANGE_GRANTS = [];
+ const BUILT_IN_AGENT_DEFAULT_GRANTS = {
+     "reflection-coach": ["agents:suggest-changes", "skills:suggest-changes"],
+ };

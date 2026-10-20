@@ -1,0 +1,40 @@
+--- a/node_modules/@paperclipai/server/dist/modules/run-dispatch/adapters/postgres.js
++++ b/node_modules/@paperclipai/server/dist/modules/run-dispatch/adapters/postgres.js
+@@ -36,6 +36,26 @@
+         currentParticipant: { type: "agent", agentId: input.agentId, interactionId: review.interaction.id },
+     } : null;
+ }
++// LOCAL-PATCH 0014
++async function isPendingInteractionAddresseeWake(dbOrTx, input) {
++    const interactionId = readNonEmptyString(input.context?.interactionId);
++    if (readNonEmptyString(input.context?.wakeReason) !== "interaction_pending" || !interactionId)
++        return false;
++    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(interactionId))
++        return false;
++    try {
++        const row = await dbOrTx
++            .select({ id: issueThreadInteractions.id })
++            .from(issueThreadInteractions)
++            .where(and(eq(issueThreadInteractions.id, interactionId), eq(issueThreadInteractions.companyId, input.companyId), eq(issueThreadInteractions.issueId, input.issueId), eq(issueThreadInteractions.status, "pending"), eq(issueThreadInteractions.addresseeAgentId, input.agentId)))
++            .limit(1)
++            .then((rows) => rows[0] ?? null);
++        return row !== null;
++    }
++    catch {
++        return false;
++    }
++}
+ function readNonEmptyString(value) {
+     return typeof value === "string" && value.trim().length > 0 ? value : null;
+ }
+@@ -374,7 +394,9 @@
+             .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)));
+         const issue = await (tx ? issueQuery.for("update") : issueQuery).then((rows) => rows[0] ?? null);
+         const wakeCommentId = deriveCommentId(context);
+-        const isInteractionWake = allowsIssueInteractionWake(context, ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS);
++        // LOCAL-PATCH 0014: an "interaction_pending" wake counts as an interaction wake only while the interaction it names is still pending on this issue and addressed to this run's agent (re-read under the lock; any lookup failure = not allowed).
++        const isInteractionWake = allowsIssueInteractionWake(context, ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS) ||
++            await isPendingInteractionAddresseeWake(dbOrTx, { companyId: input.companyId, issueId, agentId: input.agentId, context });
+         const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
+         const wakeReason = readNonEmptyString(context.wakeReason);
+         const retryReason = readNonEmptyString(context.retryReason) ?? input.scheduledRetryReason ?? null;

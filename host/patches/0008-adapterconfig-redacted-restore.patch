@@ -1,0 +1,74 @@
+--- a/node_modules/@paperclipai/server/dist/services/agents.js
++++ b/node_modules/@paperclipai/server/dist/services/agents.js
+@@ -38,6 +38,45 @@
+ function isPlainRecord(value) {
+     return typeof value === "object" && value !== null && !Array.isArray(value);
+ }
++// LOCAL-PATCH 0008: the GET agent response redacts some adapterConfig values (e.g. networkAllowlist hosts -> "***REDACTED***");
++// a client that saves a GET-derived adapterConfig back (UI secret binding flow) would STORE the literal. The server restores
++// redacted values only inside env. For every other key: an incoming value that contains the literal is accepted ONLY as an
++// unchanged echo, i.e. exactly what GET shows for the stored value (redactAgentAdapterConfig); it is then replaced by the stored
++// value. Anything else (edited list, no stored value, stored value itself redacted, create) is rejected 422.
++import { redactAgentAdapterConfig as redactAdapterConfigForEcho0008 } from "../redaction.js";
++function containsRedactedLiteral(value) {
++    if (value === REDACTED_EVENT_VALUE) return true;
++    if (Array.isArray(value)) return value.some(containsRedactedLiteral);
++    if (isPlainRecord(value)) return Object.values(value).some(containsRedactedLiteral);
++    return false;
++}
++function deepEqual0008(a, b) {
++    if (a === b) return true;
++    if (Array.isArray(a) || Array.isArray(b)) return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => deepEqual0008(v, b[i]));
++    if (isPlainRecord(a) && isPlainRecord(b)) {
++        const ka = Object.keys(a), kb = Object.keys(b);
++        return ka.length === kb.length && ka.every((k) => Object.prototype.hasOwnProperty.call(b, k) && deepEqual0008(a[k], b[k]));
++    }
++    return false;
++}
++function restoreRedactedAdapterConfigValues(incoming, stored, agentId) {
++    if (!isPlainRecord(incoming)) return incoming;
++    let out = incoming;
++    for (const key of Object.keys(incoming)) {
++        if (key === "env" || !containsRedactedLiteral(incoming[key])) continue;
++        const prior = isPlainRecord(stored) ? stored[key] : undefined;
++        const echo = prior !== undefined && !containsRedactedLiteral(prior)
++            && deepEqual0008(redactAdapterConfigForEcho0008({ [key]: prior })?.[key], incoming[key]);
++        if (!echo) {
++            logger.warn({ event: "redacted_value_rejected", agentId, key }, "adapterConfig update rejected: redacted placeholder is not an unchanged echo of the stored value");
++            throw unprocessable("redacted_value_in_update", { code: "redacted_value_in_update", key });
++        }
++        if (out === incoming) out = { ...incoming };
++        out[key] = prior;
++        logger.warn({ event: "redacted_value_restored", agentId, key }, "adapterConfig update echoed a redacted placeholder; stored value kept");
++    }
++    return out;
++}
+ function jsonEqual(left, right) {
+     return JSON.stringify(left) === JSON.stringify(right);
+ }
+@@ -600,6 +639,9 @@
+             assertBuiltInAgentMetadataMutationAllowed(existing.metadata, data.metadata, options);
+         }
+         const normalizedPatch = { ...data };
++        if (isPlainRecord(normalizedPatch.adapterConfig)) { // LOCAL-PATCH 0008
++            normalizedPatch.adapterConfig = restoreRedactedAdapterConfigValues(normalizedPatch.adapterConfig, existing.adapterConfig, id);
++        }
+         if (data.permissions !== undefined) {
+             normalizedPatch.permissions = normalizeAgentPermissions(data.permissions);
+         }
+@@ -711,6 +753,7 @@
+             const normalizedPermissions = normalizeAgentPermissions(data.permissions, { context: "create" });
+             const runtimeConfig = normalizeRuntimeConfigForNewAgent(data.runtimeConfig);
+             const adapterType = data.adapterType ?? "process";
++            if (isPlainRecord(data.adapterConfig)) restoreRedactedAdapterConfigValues(data.adapterConfig, {}, null); // LOCAL-PATCH 0008 (create: nothing to restore, rejects)
+             const rawAdapterConfig = isPlainRecord(data.adapterConfig)
+                 ? await secretsSvc.normalizeAdapterConfigForPersistence(companyId, data.adapterConfig, { adapterType })
+                 : {};
+@@ -910,6 +953,7 @@
+                     return null;
+                 const approvedPatch = approvedPayload ? configPatchFromApprovalPayload(approvedPayload) : {};
+                 let patch = { ...approvedPatch };
++                if (isPlainRecord(patch.adapterConfig)) patch.adapterConfig = restoreRedactedAdapterConfigValues(patch.adapterConfig, existing.adapterConfig, id); // LOCAL-PATCH 0008
+                 let approvalBindingDecision = null;
+                 if (Object.prototype.hasOwnProperty.call(patch, "adapterConfig") &&
+                     isPlainRecord(patch.adapterConfig)) {
